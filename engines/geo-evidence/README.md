@@ -10,8 +10,3 @@ upserted into the same query store.
 
 The upstream customer-facing future-frontdesk constants remain available only
 for compatibility tests. Runtime integration uses `personal-case.mjs`.
-
-The PengManager public edition replaces the legacy personal query fixture
-`personal-case-v1-queries.json` with an empty baseline and feeds fictional
-example queries from the host. The original Apache-2.0 attribution is retained
-in [NOTICE](NOTICE).

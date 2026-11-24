@@ -14,9 +14,9 @@ engines/geo-evidence/LICENSE and engines/geo-evidence/NOTICE.
 
 WorkLoom-video-edit
 https://github.com/geniusdapeng-collab/WorkLoom-video-edit
-Apache License, Version 2.0. The public edition includes selected shared files
-from the PengManager integration. It uses a separately configured video engine
-for native video production. The upstream license is in engines/video-edit/LICENSE.
+Apache License, Version 2.0. The public edition includes the native engine source and a reviewed asset
+inventory. Operators configure local runtime tools and separately licensed
+resources for the work they perform. The upstream license is in engines/video-edit/LICENSE.
 
 DeepSeek-V4.1-Flash-1017 tokenizer and prompt format
 Copyright (c) 2023 DeepSeek

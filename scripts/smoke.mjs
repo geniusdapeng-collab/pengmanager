@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPengManagerApplication } from "../src/application.mjs";
 import { hashAdminPassword } from "../src/security/admin-auth.mjs";
-import { demoEnvironment } from "./demo.mjs";
+import { demoEnvironment, demoSeedDirectory } from "./demo.mjs";
 
 const directory = await mkdtemp(join(await realpath(tmpdir()), "pengmanager-smoke-"));
 const password = randomBytes(24).toString("base64url");
@@ -24,6 +24,7 @@ try {
   const env = demoEnvironment(directory, { passwordHash: await hashAdminPassword(password) });
   application = await createPengManagerApplication({
     env,
+    seedDirectory: demoSeedDirectory,
     finalContentBackup: null,
     logger: { log() {} },
   });
@@ -62,7 +63,9 @@ try {
   const admin = await check("administrator_page", "/admin", 200, { headers });
   assert.match(await admin.text(), /<html(?:\s|>)/i);
   const bootstrap = await check("administrator_bootstrap", "/api/bootstrap", 200, { headers });
-  assert.ok(typeof await bootstrap.json() === "object");
+  const bootstrapped = await bootstrap.json();
+  assert.equal(bootstrapped.accounts.length, 1);
+  assert.equal(bootstrapped.accounts[0].id, "demo-github");
   const editorial = await check("editorial_bootstrap", "/api/editorial/bootstrap", 200, { headers });
   assert.ok(typeof await editorial.json() === "object");
   const geo = await check("geo_summary", "/api/geo/engine/summary", 200, { headers });

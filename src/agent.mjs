@@ -44,16 +44,9 @@ const emptyInput = value => {
 /** PengManager reuses the reviewed native CLI/MCP catalog and its server guards. */
 export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = process.env, runtimeFactory = createVideoRuntime, fetchImplementation = fetch } = {}) {
   const config = runtimeConfig({ rootDir, dataDir, env, serveWorkbench: false });
-  const nativeEntry = path.join(config.engineRoot, 'scripts', 'agent-capabilities.mjs');
-  const native = fs.existsSync(nativeEntry) ? await import(pathToFileURL(nativeEntry).href) : null;
-  const runtime = native ? runtimeFactory({
-    rootDir: config.rootDir, dataDir: config.dataRoot, env: config.env,
-    serveWorkbench: false, logger: () => undefined,
-  }) : null;
-  const catalog = native ? await native.loadCatalog(config.engineRoot)
-    : { product: { productId: null }, bundle: null, entries: new Map() };
-  const unavailable = { ready: false, state: 'unavailable', reason: 'VIDEO_RUNTIME_NOT_INSTALLED' };
-  const runtimeStatus = async () => runtime ? publicVideoStatus(await runtime.status()) : { ...unavailable };
+  const runtime = runtimeFactory({ rootDir: config.rootDir, dataDir: config.dataRoot, env: config.env, serveWorkbench: false, logger: () => undefined });
+  const native = await import(pathToFileURL(path.join(config.engineRoot, 'scripts/agent-capabilities.mjs')).href);
+  const catalog = await native.loadCatalog(config.engineRoot);
   const productionPlan = catalog.entries.get(PRODUCTION_PLAN);
   if (productionPlan) catalog.entries.set(PRODUCTION_PLAN, { ...productionPlan,
     description: '只读预览本机视频规划材料。实际生成在鹏经理原生工作台按当前镜头资格、预算和围栏执行。',
@@ -86,17 +79,6 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
     return true;
   }
   async function preflight(input, descriptor) {
-    if (!native) {
-      if (!input || Array.isArray(input) || typeof input !== 'object' ||
-          Object.keys(input).some(key => key !== 'startNative') ||
-          ('startNative' in input && typeof input.startNative !== 'boolean')) {
-        throw new AgentError('INVALID_INPUT', 'Preflight accepts only an optional boolean startNative.');
-      }
-      return { schemaVersion: 'pengmanager.video-agent-preflight/v1', status: await runtimeStatus(),
-        localInstalled: false, startup: input.startNative ? 'setup-required' : 'not-requested',
-        checks: [{ key: 'embedded-runtime', ok: false, code: unavailable.reason }],
-        textModelConfig: null, modelReadiness: null, providerCallsPerformed: false, productionVerified: false };
-    }
     native.validateInput(descriptor, input);
     const doctor = await runtime.doctor();
     const localInstalled = doctor.ok === true && doctor.workspaceInitialized === true;
@@ -144,7 +126,7 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
     list() { return { schemaVersion: 'pengmanager.agent-capabilities/v1', productId: 'pengmanager-system', embeddedProductId: catalog.product.productId, bundleId: catalog.bundle, capabilities: [...entries.values()] }; },
     describe(id) { const descriptor = entries.get(id); if (!descriptor) throw new AgentError('NOT_FOUND', 'The capability is not registered.'); return descriptor; },
     tools() {
-      return [...(native?.mcpTools(catalog) ?? []).map(tool => ({ ...tool, name: tool.name.replace(/^workloom_/, 'pengmanager_') })), ...specials.map(item => ({
+      return [...native.mcpTools(catalog).map(tool => ({ ...tool, name: tool.name.replace(/^workloom_/, 'pengmanager_') })), ...specials.map(item => ({
         name: item.id.replaceAll('.', '_'), title: item.title, description: item.description,
         inputSchema: item.inputSchema, annotations: { readOnlyHint: item.operation === 'read', destructiveHint: false, idempotentHint: true, openWorldHint: false },
       }))];
@@ -153,12 +135,8 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
     async invoke(id, input = {}) {
       const descriptor = entries.get(id);
       if (!descriptor) throw new AgentError('NOT_FOUND', 'The capability is not registered.');
-      if (id === 'pengmanager.video.status') { emptyInput(input); return runtimeStatus(); }
-      if (id === 'pengmanager.video.capabilities') {
-        emptyInput(input);
-        if (!runtime) throw new AgentError(unavailable.reason, 'Install a compatible native video runtime before reading its capabilities.');
-        return publicVideoCapabilities(await runtime.capabilities());
-      }
+      if (id === 'pengmanager.video.status') { emptyInput(input); return publicVideoStatus(await runtime.status()); }
+      if (id === 'pengmanager.video.capabilities') { emptyInput(input); return publicVideoCapabilities(await runtime.capabilities()); }
       if (id === VIDEO_PREFLIGHT) return preflight(input, descriptor);
       if (id === standardWorkflowDescriptor.id) return standardVideoIntent(input);
       if (id === AGENT_GUIDE_ID) { emptyInput(input); return readAiAgentGuide({ rootDir: config.rootDir, dataDir: config.dataRoot,
@@ -166,7 +144,7 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
       if (id === VIDEO_STOP) {
         emptyInput(input);
         const stoppedByThisProcess = await stopManaged();
-        return { stoppedByThisProcess, status: await runtimeStatus() };
+        return { stoppedByThisProcess, status: publicVideoStatus(await runtime.status()) };
       }
       // Validate and reject disabled capabilities before starting any process.
       native.validateInput(descriptor, input);

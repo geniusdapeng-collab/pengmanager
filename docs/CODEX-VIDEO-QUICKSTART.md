@@ -1,7 +1,15 @@
-# Native video integration
+# 原生视频运行与 Agent 接入
 
-PengManager includes the source for its video supervisor and host adapters. The public release includes selected support files for the host, while the complete native engine installation is provided separately in deployments that use it. WorkLoom's public upstream is [WorkLoom-video-edit](https://github.com/geniusdapeng-collab/WorkLoom-video-edit).
+鹏经理包含原生 Edit 引擎、PostgreSQL 启动编排、模型路由、审批、分镜及渲染服务、剪辑与口播工具，还有正式后期和技术质检。源码位于 [engines/video-edit](../engines/video-edit/) 和 [src/video-runtime](../src/video-runtime/)。
 
-The native supervisor requires a compatible engine in `engines/video-edit`, a release-pinned inventory, private workspace storage and its authorized provider environment. A generic git clone of the upstream engine does not satisfy the host's inventory and integration checks. Read the [runtime source](../src/video-runtime/) when integrating a compatible distribution.
+用独立的实例目录配置运行数据和工具，安装 Node.js 与项目锁定的依赖。按流程检查本机环境。
 
-The demo runs the host without starting the native engine. With a complete installation, use `pnpm video:doctor` before enabling any native operations. Report missing setup as such. Production must follow the original job and read back the actual output, applied processing and technical checks before reporting delivery.
+```bash
+pnpm video:doctor
+pnpm video:setup
+pnpm video:start
+```
+
+`video:setup` 安装或验证本机工具、数据库和内嵌工作台。原生作业使用自己有权限的供应商和素材。公开快照逐文件核验已提供的引擎资源。受限的第三方曲目、产品素材、Live2D 等资源可根据各自条款单独配置。 [许可和出处](../NOTICE)
+
+`pnpm demo` 是无需供应商的本机体验。要对正式视频任务做预检、归档、续办和成片回读，按[原生工作流](PENGMANAGER-VIDEO-MAKE.md)和[Agent 指引](AI-AGENT-GUIDE.md)使用当前项目的原始任务 ID。

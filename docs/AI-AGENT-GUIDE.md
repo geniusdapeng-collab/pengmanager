@@ -6,4 +6,4 @@ Use the local operator console for creating or approving work. HTTP Agent creden
 
 Keep the exact user brief, account, target, data authorization and budget with the operation. Read an existing job or receipt when a request outcome is unknown. A preview, queued job, local file, or adapter capability is not evidence of external publication or paid generation.
 
-The local demo never dispatches provider work. The optional native video runtime needs its own validated checkout components, owner data directory and provider configuration. See [video integration](CODEX-VIDEO-QUICKSTART.md).
+The local demo never dispatches provider work. The bundled native video source uses its own validated asset inventory, local tool installation, owner data directory and provider configuration. See [video integration](CODEX-VIDEO-QUICKSTART.md).

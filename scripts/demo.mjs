@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const loopback = "127.0.0.1";
 const ownFile = fileURLToPath(import.meta.url);
+export const demoSeedDirectory = fileURLToPath(new URL("../data/demo/seed", import.meta.url));
 
 function demoPort(value) {
   const port = Number(value ?? "4318");
@@ -43,7 +44,7 @@ async function serve() {
     return fetchLocally(url, { ...init, redirect: "error" });
   };
   const { createPengManagerApplication } = await import(new URL("../src/application.mjs", import.meta.url));
-  const application = await createPengManagerApplication({ finalContentBackup: null });
+  const application = await createPengManagerApplication({ seedDirectory: demoSeedDirectory, finalContentBackup: null });
   try {
     await application.listen();
     console.log(`本地演示 · http://${loopback}:${process.env.PORT}/zh · 管理后台 /admin · 退出时清除演示数据`);

@@ -41,13 +41,14 @@ export async function createPengManagerApplication({
   finalContentBackup = createMacFinalContentBackup(),
   aiApproval: suppliedAiApproval,
   httpDrainTimeoutMs = 10_000,
+  seedDirectory = "data/seed",
 } = {}) {
   const host = env.HOST || "127.0.0.1";
   const port = Number(env.PORT || 4318);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("PORT must be an integer between 1 and 65535.");
   if (!Number.isSafeInteger(httpDrainTimeoutMs) || httpDrainTimeoutMs < 1 || httpDrainTimeoutMs > 30_000) throw new Error("HTTP drain timeout must be between 1 and 30000 ms.");
   const dataFile = resolve(rootDir, env.DATA_FILE || "var/state.json");
-  const dataDir = join(rootDir, "data", "seed");
+  const dataDir = resolve(rootDir, seedDirectory);
   const configuredHosts = env.ALLOWED_HOSTS?.split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
   const allowedHosts = configuredHosts?.length ? configuredHosts : ["127.0.0.1", "localhost", "::1", "[::1]"];
   const auth = createAdminAuth({ env, host, allowedHosts });

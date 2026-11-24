@@ -3,17 +3,17 @@ import test from 'node:test';
 import { createPengManagerAgent } from '../src/agent.mjs';
 import { GitHubAdapter } from '../src/adapters/github.mjs';
 
-test('public agent can serve the guide and report the missing optional engine', async () => {
-  const agent = await createPengManagerAgent({ env: {}, runtimeFactory: () => assert.fail('unexpected native startup') });
+test('the embedded agent serves its guide and its native capability catalog without starting a job', async () => {
+  const agent = await createPengManagerAgent({
+    env: {},
+    runtimeFactory: () => ({ start: () => assert.fail('unexpected native startup') }),
+  });
   try {
-    assert.equal(agent.list().embeddedProductId, null);
+    assert.equal(agent.list().embeddedProductId, 'workloom-ai-video-edit');
     assert.ok(agent.tools().some(tool => tool.name === 'pengmanager_agent_guide'));
     const guide = await agent.invoke('pengmanager.agent.guide', {});
     assert.equal(guide.documents.length, 5);
-    assert.equal((await agent.invoke('pengmanager.video.status', {})).reason, 'VIDEO_RUNTIME_NOT_INSTALLED');
-    const preflight = await agent.invoke('pengmanager.video.preflight', { startNative: true });
-    assert.equal(preflight.startup, 'setup-required');
-    assert.equal(preflight.providerCallsPerformed, false);
+    assert.ok(agent.list().capabilities.some(item => item.id === 'growth.video.production.plan'));
     await assert.rejects(agent.invoke('pengmanager.video.preflight', { startNative: 'true' }), { code: 'INVALID_INPUT' });
   } finally {
     await agent.stop();
