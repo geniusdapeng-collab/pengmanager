@@ -1,0 +1,53 @@
+{
+  "schemaVersion": "workloom.character-registry/v1",
+  "defaultModel": "young-rider-01",
+  "rules": [
+    "未指定模特时，自动使用 defaultModel（当前为 李英子）",
+    "镜头卡里出现模特姓名或其别名（如“陈卓”）时，解析到对应档案",
+    "多角色项目里，指定姓名的角色按姓名解析，其余未指定角色才回落到默认模特"
+  ],
+  "models": [
+    {
+      "ordinal": 1,
+      "id": "young-rider-01",
+      "name": "李英子",
+      "aliases": [
+        "李英子",
+        "英子",
+        "1号模特",
+        "一号模特"
+      ],
+      "archive": "bundles/ai-video/library/characters/model-01-young-rider",
+      "authorization": "synthetic-no-real-person",
+      "note": "1号成年原创虚构AI人物李英子（英子）；当前v2由真实Seedream八次独立纯文字请求生成，原始PNG与逐请求来源随仓保留；v1及其原来源保留；默认ID/编号不变。"
+    },
+    {
+      "ordinal": 2,
+      "id": "chen-zhuo",
+      "name": "陈卓",
+      "aliases": [
+        "陈卓",
+        "卓卓",
+        "2号模特",
+        "二号模特"
+      ],
+      "archive": "bundles/ai-video/library/characters/model-01-chen-zhuo",
+      "authorization": "real-authorized",
+      "note": "系统内置2号模特陈卓（旗袍历史造型），仅显式点名时使用"
+    },
+    {
+      "ordinal": 3,
+      "id": "lin-yu-an",
+      "name": "林予安",
+      "aliases": [
+        "林予安",
+        "予安",
+        "3号模特",
+        "三号模特"
+      ],
+      "archive": "bundles/ai-video/library/characters/model-02-lin-yu-an",
+      "authorization": "generated-original",
+      "note": "系统内置3号原创虚构AI模特林予安，仅显式点名时使用"
+    }
+  ]
+}

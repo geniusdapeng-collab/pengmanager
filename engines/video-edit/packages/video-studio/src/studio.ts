@@ -1,0 +1,972 @@
+/**
+ * studio.ts —— 视频工作室核心桥：HyperrealitySystem（vendor）→ 视频经理运行时
+ *
+ * 职责：
+ *  1. 装配 vendor 的 HyperrealitySystem（注入 WorkloomLLMEngine，禁止静默降级）
+ *  2. 把 7 个确认门挂到宿主审批回调（宿主负责创建 IM 审批卡并等待裁决）
+ *  3. 把流水线生命周期事件吐给宿主事件汇（宿主负责落 biz_events 五元事件）
+ *  4. 产物（PRD/镜头提示词包/定妆照清单）以结构化结果返回，宿主入 asset-cms
+ *
+ * 本包不直接依赖 @workloom/* ——通过回调接口解耦，由 apps/server 完成接线。
+ */
+
+import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { runWithConfirmationHandler, type ConfirmationHandler } from "./confirmation.js";
+import { resolveGate, type GateVerdict } from "./gates.js";
+import { WorkloomLLMEngine } from "./llm-adapter.js";
+import { createPortraitRuntime, type PortraitIndex, type PortraitInputReceipt, type PortraitRuntime, type PortraitRuntimeOptions } from "./portrait-runtime.js";
+import { currentFinalizedArchivePortraits, installPortraitArchivePlanBridge, withPortraitArchivePlan } from "./portrait-archive-plan.js";
+import { acquireVendorRequirementEntry } from "./vendor-requirement-entry.js";
+import {
+  assertRequirementContractBridge,
+  currentRequirementMetadata,
+  installVendorRequirementContractBridge,
+  withRequirementContractScope,
+} from "./requirement-contract-bridge.js";
+import { preparePrdAuthority, prdDurationContract, type PrdAuthority, type PrdMarketingAuthority } from "./prd-authority.js";
+import {
+  assertPrdAuthorityBridge,
+  consumePromptReviewContracts,
+  installVendorPrdAuthorityBridge,
+  installVendorPrdProductionBridge,
+  withPrdAuthorityScope,
+} from "./prd-authority-bridge.js";
+import { captureRequirementTheme, type RequirementApprovedTheme } from "./requirement-authority.js";
+import { requirementHash } from "./requirement-contract.js";
+import type { ProducerReviewContracts } from "./producer-gate.js";
+import { normalizeNarrativePrdContract } from "./narrative-prd-contract.js";
+import { bindCreativeThemeModelAuthority, creativeThemeAuthority, normalizeCreativeThemeContract } from "./creative-theme-contract.js";
+import {
+  buildMarketingPreproductionReport,
+  isAbstractMarketingIntent,
+  marketingVisibleTextFromG1,
+  normalizeMarketingPromptList,
+  normalizeMarketingPromptResult,
+  normalizeMarketingPromptText,
+} from "./marketing-prompt-contract.js";
+import { configureRequirementRetryPolicy } from "./requirement-retry-policy.js";
+import {
+  applyDurationPolicyToManager,
+  installVendorAudioDisciplineBridge,
+  installVendorConfigIsolatorBridge,
+  installVendorContractBridge,
+  installVendorDurationPolicyBridge,
+  installVendorDurationProjectionBridge,
+  installVendorFieldQualityBridge,
+  installVendorMicroMotionBridge,
+  installVendorDiscoveryFixBridge,
+  installVendorPhaseInternalsDiagnostics,
+  installVendorPhaseDiagnosticsBridge,
+  installVendorPromptRebuildBridge,
+  installSharedBridge
+} from "./vendor-compat.js";
+import { AUDIO_DISCIPLINE_CLAUSE, AUDIO_NEGATIVE_TERMS } from "./shot-spec.js";
+import { loadDurationRules } from "./duration-rules.js";
+import { assertCreativeContract, compileCreativeContract, type CreativeContract, type CreativeFactInput } from "./constraint-compiler.js";
+import { CreativeRuntime, withCreativeRuntime, type CreativeRuntimeOptions } from "./creative-runtime.js";
+import { creativeCandidateHash, type CreativeCandidateAssessment } from "./creative-evaluation.js";
+import { assertProductVisualContent, extractProductVisualAuthority, type ProductVisualAuthority } from "./product-visual-authority.js";
+
+/** Project only source-bound claims from the exact privately accepted G1 bytes. */
+export function creativeFactsFromG1(marketing: PrdMarketingAuthority): CreativeFactInput {
+  const { content, sha256: hash } = marketing.g1Artifact;
+  if (createHash("sha256").update(content).digest("hex") !== hash) throw new Error("CREATIVE_FACTS_REQUIRED: accepted G1 bytes changed");
+  const factBundle = (JSON.parse(content) as { facts: { collectedAt?: string; sources?: Array<{ fetchedAt?: string }>;
+    stages?: Array<{ facts?: { claims?: Array<Record<string, unknown>> } }> } }).facts;
+  const claims = (factBundle.stages ?? []).flatMap(stage => stage.facts?.claims ?? [])
+    .filter(claim => claim.status === "source-bound" && typeof claim.claimId === "string"
+      && typeof claim.value === "string" && typeof claim.sourceId === "string" && typeof claim.textSha256 === "string")
+    .map(claim => ({ id: String(claim.claimId), text: String(claim.value), sourceRef: `${String(claim.sourceId)}#${String(claim.textSha256)}` }));
+  const now = Date.now(), collected = Date.parse(factBundle.collectedAt ?? "");
+  const sourceTimes = (factBundle.sources ?? []).map(source => Date.parse(source.fetchedAt ?? ""));
+  if (!Number.isFinite(collected) || collected > now + 30_000 || sourceTimes.some(time => !Number.isFinite(time) || time > now + 30_000)) {
+    throw new Error("CREATIVE_FACTS_REQUIRED: accepted G1 has no verifiable collection/source time");
+  }
+  return { content, hash, claims, validUntil: new Date(Math.min(collected, ...sourceTimes) + 24 * 3600_000).toISOString() };
+}
+
+/** vendor 引擎暴露的最小结构（HyperrealitySystem 实例方法） */
+interface HyperrealitySystemLike {
+  create(
+    intent: string,
+    metadata: Record<string, unknown>,
+    options: Record<string, unknown>
+  ): Promise<PreproductionResult>;
+}
+
+interface HyperrealitySystemCtor {
+  new (options: Record<string, unknown>): HyperrealitySystemLike;
+}
+
+/** Count current, project-bound archive copies, never a self-reported reuse total. */
+function verifiedReusedPortraitCount(index: PortraitIndex, projectId: string): number {
+  const seen = new Set<string>();
+  const verifyFile = (receipt: PortraitInputReceipt): void => {
+    if (!receipt || typeof receipt.path !== "string" || typeof receipt.realPath !== "string"
+      || !/^[a-f0-9]{64}$/i.test(receipt.sha256) || !Number.isSafeInteger(receipt.bytes) || receipt.bytes <= 0) {
+      throw new Error("PORTRAIT_REUSE_COUNT_INVALID: 文件回执不完整");
+    }
+    const realPath = realpathSync(receipt.path);
+    const stat = statSync(realPath);
+    const bytes = readFileSync(realPath);
+    if (!stat.isFile() || realPath !== receipt.realPath || stat.size !== receipt.bytes || bytes.length !== receipt.bytes
+      || createHash("sha256").update(bytes).digest("hex") !== receipt.sha256 || realpathSync(receipt.path) !== realPath) {
+      throw new Error("PORTRAIT_REUSE_COUNT_INVALID: 当前文件与复用回执不一致");
+    }
+  };
+  for (const entry of Object.values(index.characters)) {
+    for (const [angle, receipt] of Object.entries(entry.reuseReceipts ?? {})) {
+      const identity = JSON.stringify([entry.id, angle]);
+      if (seen.has(identity) || index.projectId !== projectId || receipt.projectId !== projectId
+        || receipt.schemaVersion !== "workloom.portrait-reuse/v1" || receipt.kind !== "character"
+        || receipt.id !== entry.id || receipt.angle !== angle || receipt.generationCount !== 0
+        || !Number.isSafeInteger(receipt.version) || receipt.version <= 0
+        || entry.pinnedVersion !== receipt.version || entry.portraitVersion !== receipt.version
+        || entry.files[angle] !== receipt.output?.path || !entry.artifacts?.[angle]
+        || entry.artifacts[angle]?.path !== receipt.output?.path
+        || entry.artifacts[angle]?.realPath !== receipt.output?.realPath
+        || entry.artifacts[angle]?.sha256 !== receipt.output?.sha256
+        || entry.artifacts[angle]?.bytes !== receipt.output?.bytes) {
+        throw new Error("PORTRAIT_REUSE_COUNT_INVALID: 角色、版本、角度或项目绑定不匹配");
+      }
+      verifyFile(receipt.output);
+      verifyFile(receipt.source);
+      verifyFile(receipt.profile);
+      if (receipt.source.sha256 !== receipt.output.sha256 || receipt.source.bytes !== receipt.output.bytes
+        || !receipt.manifest || typeof receipt.manifest.path !== "string"
+        || createHash("sha256").update(readFileSync(receipt.manifest.path)).digest("hex") !== receipt.manifest.sha256) {
+        throw new Error("PORTRAIT_REUSE_COUNT_INVALID: 归档来源或清单字节不匹配");
+      }
+      seen.add(identity);
+    }
+  }
+  return seen.size;
+}
+
+export interface PreproductionResult {
+  success: boolean;
+  stages?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/** 宿主审批回调：收到待审批内容，返回裁决（由 IM 审批卡驱动） */
+export type ApprovalCallback = (approval: {
+  gate: string;
+  vendorType: string;
+  title: string;
+  contentMd: string;
+  runId: string | null;
+  /** Exact structured source cards for G6; never reconstructed from Markdown. */
+  contracts?: ProducerReviewContracts;
+  /** Private callback data from this run's native archived portrait finalizer. */
+  archivePortraitStage?: { status: "completed"; characters: number; products: number; completedPortraits: number;
+    pendingPortraits: number; reusedPortraits: number; generatedPortraits: number };
+}) => Promise<GateVerdict>;
+
+/** 宿主事件汇：流水线生命周期事件（宿主落五元事件库） */
+export type EventSink = (event: {
+  kind:
+    | "pipeline.started"
+    | "pipeline.gate.requested"
+    | "pipeline.gate.resolved"
+    | "pipeline.duration.projected"
+    | "pipeline.duration.infeasible"
+    | "pipeline.duration.skipped"
+    | "pipeline.duration.package_check"
+    | "pipeline.finished"
+    | "pipeline.failed";
+  projectId: string;
+  runId: string | null;
+  gate?: string;
+  payload?: Record<string, unknown>;
+}) => void | Promise<void>;
+
+/** 定妆照真实出图配置（StudioConfig.portraits 口径；workDir/projectId 由 studio 运行期补齐） */
+export type StudioPortraitConfig =
+  | (Omit<PortraitRuntimeOptions, "workDir" | "projectId" | "log"> & { enabled?: true })
+  | { enabled: false };
+
+export interface StudioConfig {
+  llm: WorkloomLLMEngine;
+  /** 项目工作目录（checkpoints / characters / confirmations 等运行产物根） */
+  workDir: string;
+  /** Private worker session only; HTTP metadata never enables this adapter. */
+  creativeExecution?: {
+    mode: "enforce";
+    rawIntent: string;
+    sourceMetadata: Record<string, unknown>;
+    selectCandidate(input: { contract: CreativeContract; visualAuthority?: ProductVisualAuthority; creativeInput: unknown;
+      assertCurrent: () => Promise<void> }): Promise<CreativeCandidateAssessment>;
+    reviewShot?: CreativeRuntimeOptions["reviewShot"];
+    session: {
+      readonly contract: CreativeContract;
+      bindContract(contract: CreativeContract, marketing?: PrdMarketingAuthority): Promise<CreativeContract>;
+      assertCurrent(): Promise<void>;
+      readCache(key: string): Promise<unknown | null>;
+      writeCache(key: string, value: unknown): Promise<void>;
+      beginStage(stage: string): Promise<void>;
+      completeStage(stage: string, output: unknown): Promise<void>;
+      onEvent(event: { kind: string; payload: Record<string, unknown> }): Promise<void>;
+    };
+  };
+  onApproval: ApprovalCallback;
+  onEvent?: EventSink;
+  /** 总截止（毫秒），默认 1 小时，与 vendor 默认一致 */
+  totalDeadlineMs?: number;
+  llmTimeoutMs?: number;
+  /**
+   * 定妆照真实出图（火山方舟 Seedream）。缺省或 `enabled:false` 时保持 vendor 默认：
+   * interactive + spec（只出规格包，不出图）——那是"等人确认"的旧口径，全自动预生产必须开启。
+   */
+  portraits?: StudioPortraitConfig;
+  /**
+   * 渲染移交宿主 render-operator（融合设计 §6：vendor 只做预生产，渲染由 render-operator
+   * 按 G8 围栏提交）。true 时 vendor Layer 3 只做校验不提交 —— 避免同一批镜头被
+   * vendor 与宿主各提交一次、双份烧额度。
+   */
+  deferRender?: boolean;
+  /** 运行期日志（默认 console.log） */
+  log?: (line: string) => void;
+  /**
+   * 镜头时长策略（2026-09-23）：默认从媒体目录读取模型能力（Seedance 2.5 实测 4–30s），
+   * 并把 vendor 的三处 15s 口径统一放宽，避免"计划能拍、提交被拒"或节奏被悄悄夹紧。
+   */
+  durationPolicy?: { maxSingleShotSeconds?: number; minSingleShotSeconds?: number };
+  /**
+   * 商品情报档案（Stage -2 · 珍妮纺织机）运行参数（2026-09-25 激活）。
+   *
+   * 为什么要有：vendor 的情报层是**数据驱动**的（`metadata.dataMining` / `metadata.brief.product`
+   * 存在才跑），而 `spec` 模式且无 executor 时只产出《采集任务书》、不产档案——宿主此前
+   * 两样都没接，于是营销片实际等于叙事片跑法。这里把四个运行开关显式透传给 vendor：
+   *
+   *  - `mode`：`spec`（出任务书，等执行方回填）| `api`（注入 executor 全自动五站）；
+   *  - `executor`：api 模式的检索执行器（宿主实现，见 apps/server/src/video/data-mining-executor.ts）；
+   *  - `refresh`：命中旧档案也强制重跑（默认复用未过期档案，30 天 stale）；
+   *  - `raw`：执行方已完成回填时直接装订（免重复检索）；
+   *  - `storeRoot`：档案落盘根（缺省 `<workDir>/dossiers`，按工作区隔离）。
+   */
+  dataMining?: {
+    mode?: "spec" | "api";
+    executor?: (stage: string, plan: Record<string, unknown>) => Promise<Record<string, unknown> | null>;
+    refresh?: boolean;
+    raw?: Record<string, unknown>;
+    storeRoot?: string;
+    staleAfterDays?: number;
+    /** 仅服务宿主在完整来源/G1通过后装配；浏览器metadata中的同名字段没有权限。 */
+    verifiedRaw?: {
+      projectId: string;
+      rawJson: string;
+      sha256: string;
+      productQuery: Record<string, unknown>;
+      /** 私有 accepted-current-G1 导出；metadata 中的同名值没有权限。 */
+      prdAuthority?: PrdMarketingAuthority;
+    };
+  };
+}
+
+export interface RunInput {
+  projectId: string;
+  /** 创作意图原文（故事/主题/营销 Brief） */
+  intent: string;
+  metadata?: Record<string, unknown>;
+  /** 是否为社媒营销类输入（决定是否强制情报层节点 0） */
+  isMarketing?: boolean;
+}
+
+function resolveVendorEntry(): string {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  // src/ 运行（tsx）与 dist/ 运行（构建产物）两种布局都尝试
+  const candidates = [
+    path.resolve(here, "../../../vendor/supermickey/hyperreality-system/index.js"),
+    path.resolve(here, "../../../../vendor/supermickey/hyperreality-system/index.js")
+  ];
+  const require = createRequire(import.meta.url);
+  for (const p of candidates) {
+    try {
+      require.resolve(p);
+      return p;
+    } catch {
+      /* try next */
+    }
+  }
+  throw new Error("未找到 vendor/supermickey/hyperreality-system/index.js");
+}
+
+export class VideoStudio {
+  private readonly cfg: StudioConfig;
+
+  constructor(cfg: StudioConfig) {
+    this.cfg = cfg;
+  }
+
+  /**
+   * 跑一条完整预生产流水线（节点 0 情报 → 主题 → 洞察 → PRD → 镜头提示词 → 定妆照）
+   * 渲染不在此内：渲染由 render-operator 消费 render_scripts 后单独执行（融合设计 §6）
+   */
+  async runPreproduction(input: RunInput): Promise<PreproductionResult> {
+    const { cfg } = this;
+    const creativeEnforce = cfg.creativeExecution?.mode === "enforce";
+    const metadata = structuredClone(input.metadata ?? {});
+    delete metadata._dataDossier;
+    let creativePrdSource: CreativeContract | undefined;
+    if (creativeEnforce && cfg.creativeExecution) {
+      // Carry explicit customer values into the native view before it chooses
+      // defaults. The persisted customer bytes and G1 inputs remain untouched.
+      const seed = cfg.creativeExecution.session.contract;
+      assertCreativeContract(seed, { allowNeedsInput: true });
+      const explicit = (id: string) => seed.constraints.some(constraint => constraint.id === id && constraint.source === "customer");
+      // A resumed attempt can still start from a valid older contract which
+      // had not recognized a duration alias. Re-derive the native duration
+      // from its immutable source inputs; binding the current G1 below
+      // persists a separate revision if the newly compiled contract differs.
+      const currentSource = compileCreativeContract({ scope: seed.scope, rawIntent: seed.rawIntent,
+        metadata: seed.sourceMetadata, isMarketing: seed.route === "marketing" });
+      assertCreativeContract(currentSource, { allowNeedsInput: true });
+      if (input.isMarketing) creativePrdSource = currentSource;
+      const duration = currentSource.constraints.find(constraint => constraint.id === "duration.final" && constraint.source === "customer");
+      const nativeBrief = metadata.brief && typeof metadata.brief === "object" && !Array.isArray(metadata.brief)
+        ? metadata.brief as Record<string, unknown> : {};
+      if (duration) nativeBrief.duration = metadata.target_duration = currentSource.profile.finalDuration;
+      if (explicit("delivery.aspectRatio")) {
+        nativeBrief.aspectRatio = metadata.aspectRatio = seed.profile.aspectRatio;
+        if (Object.hasOwn(nativeBrief, "aspect_ratio")) nativeBrief.aspect_ratio = seed.profile.aspectRatio;
+      }
+      metadata.brief = nativeBrief;
+    }
+    const verified = cfg.dataMining?.verifiedRaw;
+    let verifiedRaw: Record<string, unknown> | undefined;
+    let prdAuthority: PrdAuthority | undefined;
+    let validateRequirementAuthority: (() => void) | undefined;
+    let approvedRequirementTheme: RequirementApprovedTheme | undefined;
+    let creativeRuntime: CreativeRuntime | undefined;
+    let selectedCandidateHash: string | undefined;
+    let themeProjectionOrdinal = 0;
+    if (input.isMarketing) {
+      if (!verified || verified.projectId !== input.projectId || createHash("sha256").update(verified.rawJson).digest("hex") !== verified.sha256) {
+        throw new Error("MARKETING_G1_REQUIRED：营销创意只能消费本次宿主G1通过的事实回填");
+      }
+      const parsed = JSON.parse(verified.rawJson) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || ["A1", "A2", "A3"].some(stage => !parsed[stage] || typeof parsed[stage] !== "object")) {
+        throw new Error("MARKETING_G1_REQUIRED：本次事实回填未覆盖三站");
+      }
+      if (!verified.productQuery || typeof verified.productQuery.name !== "string" || !verified.productQuery.name.trim()
+        || Object.keys(verified.productQuery).some(key => !["name", "brand", "category", "model"].includes(key))) {
+        throw new Error("MARKETING_G1_REQUIRED：商品查询必须来自本次已审事实包");
+      }
+      metadata.dataMining = structuredClone(verified.productQuery);
+      verifiedRaw = parsed;
+      if (!verified.prdAuthority) throw new Error("MARKETING_PRD_AUTHORITY_REQUIRED：营销 PRD 缺少本次宿主私有 G1 权威原件");
+      prdAuthority = preparePrdAuthority({ metadata, marketing: verified.prdAuthority, workDir: cfg.workDir, projectId: input.projectId,
+        ...(creativePrdSource ? { creativeContract: creativePrdSource } : {}) });
+      const prepared = prdAuthority, preparedHash = requirementHash(prepared);
+      const rawHash = verified.sha256, queryHash = requirementHash(verified.productQuery);
+      validateRequirementAuthority = () => {
+        const current = cfg.dataMining?.verifiedRaw;
+        if (current !== verified || current.projectId !== input.projectId || current.sha256 !== rawHash
+          || createHash("sha256").update(current.rawJson).digest("hex") !== rawHash
+          || requirementHash(current.productQuery) !== queryHash || !current.prdAuthority) {
+          throw new Error("REQUIREMENT_AUTHORITY_CHANGED：本次宿主私有 G1 回填入口已经变化");
+        }
+        // Reuse the existing verifier with Studio-owned workDir/project, including
+        // exact current file bytes. Do not infer a path from untrusted metadata.
+        const checked = preparePrdAuthority({ metadata: prepared.metadata, marketing: current.prdAuthority,
+          workDir: cfg.workDir, projectId: input.projectId, ...(creativePrdSource ? { creativeContract: creativePrdSource } : {}) });
+        if (requirementHash(checked) !== preparedHash) {
+          throw new Error("REQUIREMENT_AUTHORITY_CHANGED：本次宿主私有 G1 或客户口径与冻结快照不一致");
+        }
+      };
+    }
+    const log = cfg.log ?? ((line: string) => console.log(line));
+    const emit: EventSink = (e) => (cfg.onEvent ? cfg.onEvent(e) : undefined);
+    let runId: string | null = null;
+    const noPeople = metadata.builtinCharacterSelection
+      && typeof metadata.builtinCharacterSelection === "object"
+      && (metadata.builtinCharacterSelection as Record<string, unknown>).mode === "none";
+    const brief = metadata.brief && typeof metadata.brief === "object"
+      ? metadata.brief as Record<string, unknown>
+      : {};
+    const requestedDuration = Number((prdAuthority ? prdDurationContract(prdAuthority.profile).contentDurationSeconds : undefined) ?? brief.duration ?? 0);
+    const promptOptions = {
+      targetDuration: Number.isFinite(requestedDuration) && requestedDuration > 0 ? requestedDuration : 30,
+      noPeople: Boolean(noPeople),
+      abstractOnly: input.isMarketing && isAbstractMarketingIntent(input.intent, metadata, prdAuthority?.profile),
+      frameRate: prdAuthority?.profile.frameRate ?? 30,
+      aspectRatio: prdAuthority?.profile.aspectRatio,
+      resolution: prdAuthority?.profile.resolution,
+      subtitleMode: prdAuthority?.profile.subtitleMode,
+      allowedVisibleText: prdAuthority ? marketingVisibleTextFromG1(prdAuthority.marketing.g1Artifact.content) : [],
+    };
+
+    let portraitRuntime: PortraitRuntime | null = null;
+    const captureArchivePortraits = creativeEnforce && cfg.portraits?.enabled !== false && cfg.portraits?.archivedCharactersOnly === true;
+    const handler: ConfirmationHandler = async (req) => {
+      const gate = resolveGate(req.type);
+      const gateRunId = req.runId ?? runId;
+      let archivePortraitStage: Parameters<ApprovalCallback>[0]["archivePortraitStage"];
+      if (gate === "G7_FINAL" && captureArchivePortraits) {
+        const stats = currentFinalizedArchivePortraits(gateRunId);
+        if (!stats || !portraitRuntime) throw new Error("PORTRAIT_REUSE_UNVERIFIED: 最终评审缺少本次实际定妆照交付结果");
+        const reused = verifiedReusedPortraitCount(portraitRuntime.snapshot(), input.projectId);
+        archivePortraitStage = { status: "completed", characters: stats.characterCount, products: stats.productCount,
+          completedPortraits: stats.completedPortraits, pendingPortraits: stats.pendingPortraits,
+          reusedPortraits: reused, generatedPortraits: stats.completedPortraits - reused };
+      }
+      const normalizedPrompt = !creativeEnforce && input.isMarketing && gate === "G6_PROMPT"
+        ? normalizeMarketingPromptText(req.content, promptOptions)
+        : null;
+      if (normalizedPrompt && normalizedPrompt.changes.length > 0) {
+        log(`[studio] ${gate} 宿主提示词归一：${normalizedPrompt.changes.join("、")}`);
+      }
+      if (gate === "G2_THEME" && prdAuthority) approvedRequirementTheme = undefined;
+      const selection = ["G2_THEME", "G3_INSIGHT", "G4_PRD"].includes(gate) ? creativeRuntime?.selectionContext() : undefined;
+      const approvalContent = (normalizedPrompt?.value ?? req.content) + (selection ?? "");
+      await emit({
+        kind: "pipeline.gate.requested",
+        projectId: input.projectId,
+        runId: req.runId ?? runId,
+        gate,
+        payload: { vendorType: req.type, ...(selection ? { selectedCandidateHash } : {}) }
+      });
+      const contracts = gate === "G6_PROMPT"
+        ? consumePromptReviewContracts(req.content)
+        : undefined;
+      const verdict = await cfg.onApproval({
+        gate,
+        vendorType: req.type,
+        title: `预生产确认门 · ${gate}`,
+        contentMd: approvalContent,
+        runId: gateRunId,
+        ...(contracts ? { contracts } : {}),
+        ...(archivePortraitStage ? { archivePortraitStage } : {}),
+      });
+      if (gate === "G2_THEME" && prdAuthority) {
+        approvedRequirementTheme = captureRequirementTheme(prdAuthority, approvalContent, verdict);
+      }
+      await emit({
+        kind: "pipeline.gate.resolved",
+        projectId: input.projectId,
+        runId: req.runId ?? runId,
+        gate,
+        payload: { approved: verdict.approved, reason: verdict.reason }
+      });
+      return verdict;
+    };
+
+    return runWithConfirmationHandler(handler, async () => {
+      const disposers: Array<() => void> = [];
+      const keep = (dispose: () => void): void => { disposers.push(dispose); };
+      let runFailure: { error: unknown } | undefined;
+      try {
+        // The entry is pinned and patched in memory before any consumer obtains its
+        // constructor. Its ready CJS cache is process-lived; this lease owns only a
+        // run reference, and temporary prototype bridges are released first.
+        const vendorEntry = acquireVendorRequirementEntry(resolveVendorEntry());
+        keep(vendorEntry.release);
+        const { HyperrealitySystem } = vendorEntry.exports as unknown as { HyperrealitySystem: HyperrealitySystemCtor };
+        /**
+         * 注入依赖保活（vendor ConfigIsolator 会摊平类实例，见 vendor-compat.ts）：
+         * 必须在本实例装配之前打上，否则注入的 LLM 引擎在隔离后变成"空心对象"，
+         * 链路最开头的创意主题生成器会静默降级成规则兜底（真机 2026-09-22 事故）。
+         */
+        keep(installVendorConfigIsolatorBridge());
+        keep(installSharedBridge("vendor-portrait-archive-plan", installPortraitArchivePlanBridge));
+        /** 阶段异常栈诊断：Phase 3/3.5 失败时把栈写进 run 日志（vendor 只打 message，真机无法定位行号） */
+        keep(installVendorPhaseDiagnosticsBridge({ log }));
+        /**
+         * 字段质检桥：Phase 3.5 对结构化 timeline 崩 `tl.match` / `result.reports` 缺失导致整套质检失败
+         * （真机：FieldGuard 默认模板覆盖 6 镜并标记降级）。入参归一 + 结果兜底。
+         */
+        keep(installVendorFieldQualityBridge({ log }));
+        /**
+         * 微动作桥：`_extractCameraDistance` 只读 `camera`（实际字段是 camera_movement）+ 模板缺 neutral
+         * → 真机两次 run 均 0/6 增强（环节空转）。补齐字段映射与 neutral 模板。
+         */
+        keep(installVendorMicroMotionBridge({ log }));
+        /**
+         * 契约桥：Phase1→2/2→3/3→Output 的类型不匹配此前只告警（且 autoFix 对逐镜头字段不生效），
+         * 导致对象字段以 `[object Object]` 进入提示词。这里做入参归一 + 契约账本留痕。
+         */
+        keep(installVendorContractBridge({ log }));
+        /**
+         * 提示词重建桥：Phase 3 失败（真机 `Assignment to constant variable.`）时 6 镜 prompt 为空，
+         * 最终被 PipelineGuard 严格模式拦下、整条 run 无产物。用 vendor 自己的组装器按字段重建，
+         * 并标记 promptRebuilt（非静默兜底）。
+         */
+        keep(installVendorPromptRebuildBridge({ log }));
+        /** 需求洞察 _fillDefaults 修复（数组保形 + 消除 const 重赋值，静态审计发现） */
+        keep(installVendorDiscoveryFixBridge({ log }));
+        keep(installSharedBridge("vendor-requirement-contract-v1", () => installVendorRequirementContractBridge(
+          HyperrealitySystem as unknown as { prototype: Record<string, unknown> }, vendorEntry.identity.entryPath
+        )));
+        assertRequirementContractBridge((HyperrealitySystem as unknown as { prototype: Record<string, unknown> }).prototype);
+        if (prdAuthority) {
+          keep(installSharedBridge("vendor-prd-authority-v1", () => installVendorPrdAuthorityBridge(
+            HyperrealitySystem as unknown as { prototype: Record<string, unknown> }, vendorEntry.identity.entryPath
+          )));
+          assertPrdAuthorityBridge((HyperrealitySystem as unknown as { prototype: Record<string, unknown> }).prototype);
+        }
+        /** Phase 3 后融合链路深栈诊断（vendor 内部 catch 会吞掉栈帧） */
+        keep(installVendorPhaseInternalsDiagnostics({ log }));
+        /** 镜头内音频纪律（禁止 BGM）与时长策略（模型能力 4–30s）两条产品口径 */
+        keep(installVendorAudioDisciplineBridge({
+          clause: AUDIO_DISCIPLINE_CLAUSE,
+          negativeTerms: AUDIO_NEGATIVE_TERMS,
+          log
+        }));
+        const durationRules = loadDurationRules();
+        const maxSingleShot = cfg.durationPolicy?.maxSingleShotSeconds ?? durationRules.modelMax;
+        const minSingleShot = cfg.durationPolicy?.minSingleShotSeconds ?? durationRules.modelMin;
+        /**
+         * 桥按"进程级共享 + 引用计数"安装（T-2026-0925-0001）：
+         * 预生产 run 允许并发，而桥是进程全局的；若每个 run 各自装卸，
+         * 先结束的 run 会把仍在运行的 run 的补丁一起还原（时长口径中途分裂）。
+         */
+        keep(installSharedBridge("vendor-duration-policy", () =>
+          installVendorDurationPolicyBridge({
+            maxSingleShotSeconds: maxSingleShot,
+            minSingleShotSeconds: minSingleShot,
+            log
+          })
+        ));
+        /**
+         * 镜头时长单点守恒投影桥（T-2026-0925-0001）：
+         * 把 vendor 的四处时长决策（剧本总量对齐 / 制作归一 / 运行期约束 / 台词修复后的重排）
+         * 全部收敛到宿主投影器；`WORKLOOM_DURATION_PROJECTION=off` 可一键回到原行为（回滚开关）。
+         */
+        const projectionEnabled = (process.env.WORKLOOM_DURATION_PROJECTION ?? "on") !== "off";
+        let lastProjectedTarget: number | null = null;
+        keep(projectionEnabled
+          ? installSharedBridge("vendor-duration-projection", () =>
+              installVendorDurationProjectionBridge({
+                minShotSeconds: minSingleShot,
+                maxShotSeconds: maxSingleShot,
+                log,
+                onEvent: (event) => {
+                  if (typeof event.targetSeconds === "number" && event.targetSeconds > 0) {
+                    lastProjectedTarget = event.targetSeconds;
+                  }
+                  void emit({
+                    kind: `pipeline.duration.${event.kind}`,
+                    projectId: input.projectId,
+                    runId,
+                    payload: {
+                      source: event.source,
+                      targetSeconds: event.targetSeconds,
+                      totalSeconds: event.totalSeconds,
+                      raised: event.shots.filter((shot) => shot.raised).map((shot) => shot.shotId),
+                      lowered: event.shots.filter((shot) => shot.lowered).map((shot) => shot.shotId),
+                      message: event.message ?? null
+                    }
+                  });
+                  if (event.kind !== "projected") {
+                    log(`[studio] 时长投影 ${event.kind}（${event.source}）：${event.message ?? ""}`);
+                  }
+                }
+              })
+            )
+          : () => undefined);
+        if (!projectionEnabled) log("[studio] 时长投影桥已按 WORKLOOM_DURATION_PROJECTION=off 关闭（回滚态）");
+        log(
+          `[studio] 时长策略：单镜 ${minSingleShot}–${maxSingleShot}s（模型目录口径，Seedance 2.5 实测上限 30s）`
+          + `；口径清单 ${durationRules.sources.length} 条（在用 ${durationRules.sources.filter((s) => s.live).length} / 未接线 ${durationRules.nonLive.length}）`
+        );
+        if (!durationRules.aligned) {
+          log(
+            `[studio] ⚠️ 仍有在用口径低于模型上限：`
+            + durationRules.blockers.map((b) => `${b.id}=${b.value}s`).join("；")
+          );
+        }
+
+        // Install after the existing compatibility wrappers; private ALS selects
+        // this run's policy, and reverse disposal restores those exact wrappers.
+        if (prdAuthority || creativeEnforce) keep(installSharedBridge("vendor-prd-production-authority-v1", () => installVendorPrdProductionBridge(
+          HyperrealitySystem as unknown as { prototype: Record<string, unknown> }, vendorEntry.identity.entryPath
+        )));
+
+        // 与 vendor CLI（app/commands/preproduction.js）保持同一装配口径
+        process.env.STORMAXE_TOTAL_DEADLINE_MS =
+          process.env.STORMAXE_TOTAL_DEADLINE_MS ?? String(cfg.totalDeadlineMs ?? 3_600_000);
+
+        /**
+         * 项目产物目录：checkpoints / characters / 渲染输出一律收在同一 workDir 下。
+         * vendor 的三个引擎各自读 `options.<engine>.charactersDir`（顶层 charactersDir 不生效），
+         * 必须逐个显式下发，否则引擎回落到 vendor 仓库自带的 characters/，定妆照与绑定清单会对不上。
+         */
+        const charactersDir = path.join(cfg.workDir, "characters", input.projectId);
+        const renderOutputDir = path.join(cfg.workDir, "video-output", input.projectId);
+
+        /**
+         * 定妆照真实出图（2026-09-21 真机修复）：不开则 vendor 停在 interactive+spec →
+         * completedPortraits=0 → 渲染门 BINDING_MANIFEST_INVALID。
+         */
+        const portraitCfg = cfg.portraits;
+        portraitRuntime = portraitCfg && portraitCfg.enabled !== false && portraitCfg.apiKey
+          ? createPortraitRuntime({
+              ...portraitCfg,
+              workDir: cfg.workDir,
+              projectId: input.projectId,
+              log
+            })
+          : null;
+        if (portraitCfg && portraitCfg.enabled !== false && !portraitCfg.apiKey) {
+          log("[studio] 定妆照真实出图未启用：缺少图像模型密钥（保持 vendor 规格包口径，不出图）");
+        }
+
+        const system = new HyperrealitySystem({
+          llmEngine: cfg.llm,
+          // These legacy enhancers overwrite already accepted creative fields or
+          // prompt text. The compiled path carries the approved source directly.
+          ...(creativeEnforce ? { characterCostume: { enabled: false }, identityPersistence: { enabled: false },
+            behaviorAnchor: { enabled: false }, shotQuality: { enabled: false },
+            directorOptimization: { enabled: false }, microMotion: { enabled: false }, promptGuardian: { strictMode: true } } : {}),
+          productionEngine: {
+            charactersDir,
+            agentConfig: {
+              enableLLMAgents: true,
+              llmTimeout: cfg.llmTimeoutMs ?? 180_000,
+              llmMaxRetries: 2,
+              llmModel: cfg.llm.model,
+              fastModel: cfg.llm.fastModel,
+              totalDeadlineMs: cfg.totalDeadlineMs ?? 3_600_000,
+              promptFusionConcurrency: 1,
+              checkpointDir: path.join(cfg.workDir, "checkpoints", input.projectId),
+              enableResume: !prdAuthority && !creativeEnforce
+            }
+          },
+          scriptEngine: { charactersDir },
+          renderingEngine: { charactersDir, outputDir: renderOutputDir },
+          charactersDir,
+          durationConstraint: { maxSingleShot, minSingleShot }
+        });
+        if (!creativeEnforce && input.isMarketing && noPeople && isAbstractMarketingIntent(input.intent, metadata, prdAuthority?.profile)) {
+          const guard = (system as unknown as { pipelineGuard?: { check?: unknown } }).pipelineGuard;
+          if (!guard || typeof guard.check !== "function") {
+            throw new Error("MARKETING_PIPELINE_GUARD_BRIDGE_UNAVAILABLE: vendor 缺少渲染前守卫");
+          }
+          const nativeGuardCheck = guard.check as (
+            this: unknown,
+            prompts: Array<Record<string, unknown>>,
+            options?: Record<string, unknown>,
+          ) => unknown;
+          guard.check = function workloomMarketingPipelineGuard(
+            this: unknown,
+            prompts: unknown,
+            guardOptions?: Record<string, unknown>,
+          ): unknown {
+            const list = Array.isArray(prompts) ? prompts.filter((item): item is Record<string, unknown> =>
+              Boolean(item && typeof item === "object" && !Array.isArray(item))) : [];
+            return Reflect.apply(nativeGuardCheck, this, [normalizeMarketingPromptList(list, promptOptions), guardOptions]);
+          };
+          const vendorReport = (system as unknown as { _generatePreproductionReport?: unknown })._generatePreproductionReport;
+          if (typeof vendorReport !== "function") {
+            throw new Error("MARKETING_PREPRODUCTION_REPORT_BRIDGE_UNAVAILABLE: vendor 缺少预生产报告生成器");
+          }
+          (system as unknown as Record<string, unknown>)._generatePreproductionReport = function workloomPreproductionReport(
+            productionResult: Record<string, unknown>,
+            scriptResult: Record<string, unknown> | null,
+            timing: Record<string, unknown> | null,
+            confirmations: Record<string, unknown> | null,
+          ): string {
+            const live = currentRequirementMetadata() ?? metadata;
+            const contract = live._workloomRequirementContract;
+            const contractScenes = contract && typeof contract === "object" && !Array.isArray(contract)
+              ? (contract as Record<string, unknown>).scenes
+              : undefined;
+            return buildMarketingPreproductionReport({
+              productionResult, scriptResult, timing, confirmations, options: promptOptions,
+              contractScenes: Array.isArray(contractScenes) ? contractScenes : [],
+            });
+          };
+        }
+        const retryPolicy = configureRequirementRetryPolicy(
+          (system as unknown as { requirementDiscoveryEngine?: unknown }).requirementDiscoveryEngine,
+        );
+        if (retryPolicy.changed.length > 0) {
+          log(`[studio] 需求洞察重试策略：${retryPolicy.changed.join("、")}`);
+        }
+        const creativeThemeGenerator = (system as unknown as {
+          creativeThemeGenerator?: Record<string, unknown>;
+        }).creativeThemeGenerator;
+        if (!creativeThemeGenerator || typeof creativeThemeGenerator.generate !== "function") {
+          throw new Error("CREATIVE_THEME_CONTRACT_BRIDGE_UNAVAILABLE: vendor 缺少 CreativeThemeGenerator.generate");
+        }
+        const currentThemeAuthority = () => creativeRuntime ? creativeThemeAuthority(creativeRuntime.contract) : undefined;
+        if (creativeEnforce) bindCreativeThemeModelAuthority(creativeThemeGenerator, currentThemeAuthority);
+        const originalThemeGenerate = creativeThemeGenerator.generate as (
+          this: Record<string, unknown>,
+          themeInput: string,
+        ) => Promise<Record<string, unknown>>;
+        creativeThemeGenerator.generate = async function workloomThemeGenerate(
+          this: Record<string, unknown>,
+          themeInput: string,
+        ): Promise<Record<string, unknown>> {
+          const generated = await Reflect.apply(originalThemeGenerate, this, [themeInput]);
+          const authority = currentThemeAuthority();
+          const normalized = normalizeCreativeThemeContract(generated, metadata, authority);
+          const durationProjected = normalized.changes.includes("brief-duration-authority-normalized");
+          const titleProjected = normalized.changes.includes("explicit-film-title-bound");
+          if (prdAuthority && creativeRuntime && cfg.creativeExecution && (durationProjected || titleProjected)) {
+            const directory = path.dirname(prdAuthority.marketing.g1Artifact.path);
+            if (realpathSync(directory) !== directory) throw new Error("CREATIVE_THEME_ARCHIVE_INVALID: 当前主题档案目录经过符号链接");
+            const raw = JSON.stringify(generated);
+            const sha256 = createHash("sha256").update(raw).digest("hex");
+            const artifact = "G2_THEME_GENERATED-" + (++themeProjectionOrdinal) + "-" + sha256 + ".json";
+            await writeFile(path.join(directory, artifact), raw, { flag: "wx", mode: 0o600, flush: true });
+            await cfg.creativeExecution.session.onEvent({ kind: durationProjected ? "creative.theme-duration.projected" : "creative.theme-title.projected", payload: {
+              artifact, sha256, bytes: Buffer.byteLength(raw), ...(durationProjected ? { durationSeconds: metadata.target_duration } : {}),
+              ...(titleProjected ? { filmTitle: authority?.filmTitle } : {}),
+              contractHash: creativeRuntime.contract.hash, g1Sha256: prdAuthority.marketing.g1Artifact.sha256,
+            } });
+          }
+          if (normalized.changes.length > 0) {
+            log(`[studio] 创意主题合同归一：${normalized.changes.join("、")}`);
+          }
+          return normalized.result;
+        };
+        if (!prdAuthority) {
+          const prdGenerator = (system as unknown as { prdGenerator?: Record<string, unknown> }).prdGenerator;
+          if (!prdGenerator || typeof prdGenerator.generate !== "function") {
+            throw new Error("NARRATIVE_PRD_CONTRACT_BRIDGE_UNAVAILABLE: vendor 缺少 PRDGenerator.generate");
+          }
+          const originalGenerate = prdGenerator.generate as (
+            this: Record<string, unknown>,
+            discoveryResult: Record<string, unknown>,
+          ) => Promise<Record<string, unknown>>;
+          prdGenerator.generate = async function narrativePrdGenerate(
+            this: Record<string, unknown>,
+            discoveryResult: Record<string, unknown>,
+          ): Promise<Record<string, unknown>> {
+            const generated = await Reflect.apply(originalGenerate, this, [discoveryResult]);
+            const scopedMetadata = currentRequirementMetadata() ?? metadata;
+            const normalized = normalizeNarrativePrdContract(generated, scopedMetadata);
+            if (normalized.changes.length > 0) {
+              log(`[studio] 叙事 PRD 合同归一：${normalized.changes.join("、")}`);
+            }
+            return normalized.prd;
+          };
+        }
+        /** 实例级放宽 rhythmProfiles（standard 12 / slow 15 → 模型上限），否则 30s 单镜会被重新夹紧 */
+        applyDurationPolicyToManager(
+          (system as unknown as { durationConstraintManager?: unknown }).durationConstraintManager,
+          maxSingleShot,
+          minSingleShot
+        );
+
+        await emit({ kind: "pipeline.started", projectId: input.projectId, runId: null });
+        /**
+         * vendor create 的第三参是"运行期开关"（batchMode/portraitExecutor/portraitRuntime/dryRun/skipRender）。
+         * deferRender=true 时 Layer 3 不提交（渲染由宿主 render-operator 走 G8 围栏提交），
+         * Layer 4 也必须跳过：没有本次真实成片字节时，后期无法成立，而且会把已完成的
+         * 预生产错误标记为失败。避免 vendor 与宿主对同一批镜头各提交一次、双份烧额度。
+         */
+        const createOptions: Record<string, unknown> = {};
+        if (cfg.deferRender === true) {
+          createOptions.skipRender = true;
+          createOptions.skipPostProduction = true;
+        }
+        /**
+         * 商品情报档案（Stage -2）开关透传：只有宿主显式装配才生效，
+         * 未装配时 vendor 保持原有行为（spec 模式出任务书、不落档案）。
+         */
+        if (cfg.dataMining) {
+          createOptions.dataMiningMode = cfg.dataMining.mode ?? "api";
+          createOptions.dataMiningStoreRoot = cfg.dataMining.storeRoot
+            ?? path.join(cfg.workDir, "dossiers");
+          if (cfg.dataMining.executor) createOptions.dataMiningExecutor = cfg.dataMining.executor;
+          if (cfg.dataMining.refresh) createOptions.dataMiningRefresh = true;
+          if (cfg.dataMining.raw) createOptions.dataMiningRaw = cfg.dataMining.raw;
+          if (cfg.dataMining.staleAfterDays) createOptions.dataMiningStaleDays = cfg.dataMining.staleAfterDays;
+          log(
+            `[studio] 商品情报档案已装配：mode=${String(createOptions.dataMiningMode)}`
+            + `${cfg.dataMining.executor ? " + 真实检索执行器" : "（无执行器：只出采集任务书）"}`
+            + `；档案根 ${String(createOptions.dataMiningStoreRoot)}`
+          );
+        }
+        if (verifiedRaw) {
+          createOptions.dataMiningRaw = verifiedRaw;
+          createOptions.dataMiningRefresh = true;
+          // G1已经由宿主在vendor.create之前评审；不受portrait batchMode影响，也不再次挑选旧缓存。
+          createOptions.skipDataMiningReview = true;
+        }
+        if (portraitRuntime) {
+          createOptions.batchMode = true;
+          createOptions.portraitExecutor = "api";
+          createOptions.portraitRuntime = portraitRuntime;
+          const modelName = portraitCfg && portraitCfg.enabled !== false ? portraitCfg.model : "未指定模型";
+          log(`[studio] 定妆照真实出图已启用（${modelName}，产物根 ${charactersDir}）`);
+        }
+        if (creativeEnforce && cfg.creativeExecution) {
+          const execution = cfg.creativeExecution, require = createRequire(vendorEntry.identity.entryPath);
+          const nativeRoot = path.dirname(vendorEntry.identity.entryPath);
+          const standardizer = require(path.join(nativeRoot, "engines/field-standardizer.js")) as {
+            CRITICAL_FIELDS: { p0: string[]; p1: string[]; p2: string[]; p3: string[] };
+            FIELD_NAME_CN: Record<string, string>;
+          };
+          const keys = [...standardizer.CRITICAL_FIELDS.p0, ...standardizer.CRITICAL_FIELDS.p1,
+            ...standardizer.CRITICAL_FIELDS.p2, ...standardizer.CRITICAL_FIELDS.p3];
+          const requiredKeys = [...standardizer.CRITICAL_FIELDS.p0, ...standardizer.CRITICAL_FIELDS.p1];
+          const labels = standardizer.FIELD_NAME_CN;
+          // Bind the real implementation dependency bytes, not a nominal cache version alone.
+          const implementationPaths = ["engines/field-standardizer.js", "engines/production-engine/production-engine.js",
+            "engines/production-engine/phases/phase-1-scene-design.js", "engines/production-engine/phases/phase-2-visual-audio.js",
+            "engines/production-engine/agents/prompt-fusion-agent.js", "engines/production-engine/agents/base-agent.js",
+            "engines/production-engine/agents/scene-design-agent.js", "engines/production-engine/agents/visual-language-agent.js",
+            "engines/production-engine/agents/audio-design-agent.js", "engines/production-engine/agents/continuity-review-agent.js"];
+          const nativeSchemaHash = requirementHash(implementationPaths.map(relative => ({ relative,
+            sha256: createHash("sha256").update(readFileSync(path.join(nativeRoot, relative))).digest("hex") })));
+          const facts = prdAuthority ? creativeFactsFromG1(prdAuthority.marketing) : undefined;
+          const next = compileCreativeContract({ scope: execution.session.contract.scope,
+            rawIntent: execution.rawIntent, metadata: execution.sourceMetadata, isMarketing: input.isMarketing,
+            ...(prdAuthority ? { profile: prdAuthority.profile as Record<string, unknown> } : {}),
+            ...(facts ? { facts } : {}), bounds: { minShotSeconds: minSingleShot, maxShotSeconds: maxSingleShot },
+            requiredFields: requiredKeys.filter(key => key !== "dialogue").map(key => labels[key]!) });
+          const contract = await execution.session.bindContract(next, prdAuthority?.marketing);
+          const visualAuthority = prdAuthority ? extractProductVisualAuthority(prdAuthority.marketing.g1Artifact.content) : undefined;
+          const assertCurrent = async () => { validateRequirementAuthority?.(); await execution.session.assertCurrent(); };
+          await assertCurrent();
+          await execution.session.completeStage("preparation", { contractHash: contract.hash,
+            sourceMetadataHash: contract.sourceMetadataHash, g1Hash: facts?.hash ?? null });
+          const selectedCandidate = await execution.selectCandidate({ contract, ...(visualAuthority ? { visualAuthority } : {}),
+            creativeInput: JSON.parse(JSON.stringify({ intent: input.intent, metadata, nativeSchemaHash })), assertCurrent });
+          await assertCurrent();
+          selectedCandidateHash = creativeCandidateHash(contract.hash, selectedCandidate.shots);
+          await execution.session.beginStage("native-preparation");
+          const options: CreativeRuntimeOptions = { contract, model: cfg.llm.model, nativeSchemaHash,
+            fields: { keys, labels, requiredKeys }, cache: { read: key => execution.session.readCache(key),
+              write: (key, value) => execution.session.writeCache(key, value) },
+            assertCurrent, selectedCandidate, preparationStage: "native-preparation",
+            ...(execution.reviewShot ? { reviewShot: execution.reviewShot } : {}),
+            beginStage: stage => execution.session.beginStage(stage),
+            completeStage: (stage, output) => execution.session.completeStage(stage, output),
+            onEvent: event => execution.session.onEvent(event),
+            ...(visualAuthority ? { visualAuthority } : {}),
+            generate: async (prompt, schema) => {
+              const response = await cfg.llm.reasonStructured(prompt, schema, { scene: "video.prompt.synthesis" });
+              if (!response.success || response.data === undefined) throw new Error(`CREATIVE_MODEL_UNVERIFIED: ${response.error ?? "missing complete JSON"}`);
+              return response.data;
+            } };
+          creativeRuntime = new CreativeRuntime(options);
+        }
+        const executeNative = () => withPrdAuthorityScope(prdAuthority, () => withRequirementContractScope(metadata, () => withPortraitArchivePlan(portraitRuntime, () =>
+          system.create(input.intent, metadata, createOptions), captureArchivePortraits
+        ), prdAuthority ? { authority: prdAuthority, validateAuthority: validateRequirementAuthority!,
+          approvedTheme: () => approvedRequirementTheme && structuredClone(approvedRequirementTheme) } : undefined), validateRequirementAuthority,
+          prdAuthority ? () => approvedRequirementTheme && structuredClone(approvedRequirementTheme) : undefined);
+        const nativeResult = creativeRuntime ? await withCreativeRuntime(creativeRuntime, executeNative) : await executeNative();
+        if (creativeRuntime && nativeResult.success) await creativeRuntime.verifyHandoff(nativeResult.shots);
+        if (creativeRuntime && selectedCandidateHash) {
+          nativeResult.stages ??= {};
+          nativeResult.stages.creativeSelection = { contractHash: creativeRuntime.contract.hash, candidateHash: selectedCandidateHash };
+        }
+        if (prdAuthority && nativeResult.shots) assertProductVisualContent(
+          extractProductVisualAuthority(prdAuthority.marketing.g1Artifact.content), nativeResult.shots, "studio-raw-final-shots");
+        const normalizedResult = !creativeEnforce && input.isMarketing
+          ? normalizeMarketingPromptResult(nativeResult, promptOptions)
+          : { value: nativeResult, changes: [] as string[] };
+        if (normalizedResult.changes.length > 0) {
+          log(`[studio] 营销提示词合同归一：${normalizedResult.changes.join("、")}`);
+        }
+        const result = normalizedResult.value;
+        // Reuse accounting proves a completed successful stage. A native refusal
+        // can return before G5 while the runtime already contains prepared copies;
+        // keep that original failure instead of replacing it with a success assertion.
+        if (portraitRuntime && result.success === true) {
+          const index = portraitRuntime.snapshot();
+          const characters = Object.keys(index.characters).length;
+          const products = Object.keys(index.products).length;
+          log(`[studio] 定妆照索引落盘：${portraitRuntime.indexPath()}（角色 ${characters} / 商品 ${products}）`);
+          const reused = verifiedReusedPortraitCount(index, input.projectId);
+          if (reused > 0) {
+            const stage = result.stages?.portraitStudio;
+            if (!stage || typeof stage !== "object" || Array.isArray(stage)) {
+              throw new Error("PORTRAIT_REUSE_COUNT_INVALID: 缺少实际定妆照执行结果");
+            }
+            const portraitStage = stage as Record<string, unknown>;
+            const completed = portraitStage.completedPortraits;
+            if (typeof completed !== "number" || !Number.isSafeInteger(completed) || completed < reused) {
+              throw new Error("PORTRAIT_REUSE_COUNT_INVALID: 复用数量超过实际完成数量");
+            }
+            portraitStage.reusedPortraits = reused;
+            portraitStage.generatedPortraits = completed - reused;
+          }
+        }
+        /**
+         * 作品级校验（T-2026-0925-0001，问题 P10）：
+         * vendor 的 `PromptDeliveryGuard.verifyPackage`（片头在场 / 平台时长带 / 禁全部同长 / 总时长 ±15%）
+         * 此前**全仓 0 处调用**，等于不存在；这里在预生产产物返回后、宣告 finished 之前补上，
+         * 结果落 `pipeline.duration.package_check` 事件（只报告不阻断；阻断由渲染提交侧负责）。
+         */
+        try {
+          const shots = (
+            (result?.stages?.productionEngine as { shots?: Array<Record<string, unknown>> } | undefined)?.shots ?? []
+          ).filter((shot) => Number(shot.duration ?? 0) > 0);
+          if (shots.length > 0) {
+            const guardMod = createRequire(import.meta.url)(
+              path.resolve(
+                fileURLToPath(new URL(".", import.meta.url)),
+                "../../../vendor/supermickey/hyperreality-system/engines/production-engine/agents/prompt-delivery-guard.js"
+              )
+            ) as { PromptDeliveryGuard: new () => { verifyPackage: (list: unknown[], options?: Record<string, unknown>) => { pass: boolean; issues: string[] } } };
+            const check = new guardMod.PromptDeliveryGuard().verifyPackage(shots, {
+              targetDuration: lastProjectedTarget ?? undefined
+            });
+            await emit({
+              kind: "pipeline.duration.package_check",
+              projectId: input.projectId,
+              runId,
+              payload: {
+                pass: check.pass,
+                issueCount: check.issues.length,
+                issues: check.issues.slice(0, 20),
+                targetSeconds: lastProjectedTarget,
+                shots: shots.length,
+                totalSeconds: shots.reduce((sum, shot) => sum + Number(shot.duration ?? 0), 0)
+              }
+            });
+            if (!check.pass) {
+              log(`[studio] ⚠️ 作品级时长校验未通过（${check.issues.length} 项）：${check.issues.slice(0, 5).join("；")}`);
+            }
+          }
+        } catch (err) {
+          log(`[studio] 作品级校验跳过：${err instanceof Error ? err.message : String(err)}`);
+        }
+        await emit({
+          kind: result.success ? "pipeline.finished" : "pipeline.failed",
+          projectId: input.projectId,
+          runId,
+          payload: { stages: Object.keys(result.stages ?? {}) }
+        });
+        return result;
+      } catch (err) {
+        runFailure = { error: err };
+        await emit({
+          kind: "pipeline.failed",
+          projectId: input.projectId,
+          runId,
+          payload: { error: err instanceof Error ? err.message : String(err) }
+        });
+        throw err;
+      } finally {
+        const cleanupErrors: unknown[] = [];
+        for (const dispose of disposers.reverse()) {
+          try {
+            dispose();
+          } catch (err) {
+            cleanupErrors.push(err);
+          }
+        }
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            [...(runFailure ? [runFailure.error] : []), ...cleanupErrors],
+            "video-studio-bridge-cleanup-failed"
+          );
+        }
+      }
+    });
+  }
+}

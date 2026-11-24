@@ -1,0 +1,360 @@
+/**
+ * gate-policy.ts —— 预生产门策略（内部准备门 / 花钱与对外门的判定口径）
+ *
+ * 为什么单独成文件（T-2026-0925-0002）：
+ *   这套口径原先只写在 `studio-worker.ts` 里，只有"服务端跑 run"这一条路径能用。
+ *   而逐环节审计要跑**不提交生产渲染的完整数据管线**（`scripts/tools/data-pipeline-run.mts`），
+ *   如果审计脚本自己抄一份门口径，就会立刻出现"审计过的门 ≠ 生产的门"的漂移。
+ *   抽成共享模块后，服务端与审计脚本消费同一份定义。
+ *
+ * 产品口径（2026-10-31 产品所有者）：视频管线内所有 review 由版本化系统策略裁决。
+ * 确定性检查、事实哈希、预算、资格、权限和围栏任一不成立即修复或阻断；
+ * `block` 仍失败关闭，kill switch 关闭时同样阻断且不创建 approvals。
+ */
+import type { GateKey } from "@hyperreality/video-studio";
+import type { ProducerStage } from "@hyperreality/video-studio";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join, resolve, relative, sep } from "node:path";
+import { currentCreativeSelectionContext, type ProducerArtifact, type DeterministicCheck, type PortraitIndex,
+  type ProducerReviewContracts } from "@hyperreality/video-studio";
+import { loadPipelineFeatureFlags } from "@workloom/pipeline-control";
+
+/**
+ * 视频管线内的 G1-G8 门统一走系统策略。G5 只在实际图片、必需角度、
+ * 当前项目索引和评审结果都通过时放行；任一证据失败即 repair/blocked。
+ */
+export const AUTO_GATES = new Set<string>([
+  "G1_DOSSIER",
+  "G2_THEME",
+  "G3_INSIGHT",
+  "G4_PRD",
+  "G5_PORTRAIT",
+  "G6_PROMPT",
+  "G7_FINAL",
+  "G8_RENDER",
+]);
+
+export const NATIVE_PROMPT_MIN_CHARS = 1_200;
+export const NATIVE_PROMPT_MAX_CHARS = 3_000;
+/** Aligns the pre-G6 package bound with the later exact qualification request ceiling. */
+export const PROMPT_PACKAGE_MAX_BYTES = 24_000_000;
+
+/**
+ * G6 receives the exact structured cards through the native bridge. These
+ * deterministic checks bind prompt length and package bytes before a semantic
+ * review can spend calls or pass a prompt that render qualification will reject.
+ */
+export function promptPackageGateChecks(contracts: ProducerReviewContracts | undefined): Array<{
+  id: string; pass: boolean; detail: string; hard: true;
+}> {
+  if (!contracts || !Array.isArray(contracts.shots) || contracts.shots.length === 0) {
+    return [{ id: "prompt-package-present", pass: false, hard: true,
+      detail: "G6 缺少来自本次原生流水线的结构化镜头卡，不能重建或猜测提示词" }];
+  }
+  const checks: Array<{ id: string; pass: boolean; detail: string; hard: true }> = [{
+    id: "prompt-package-present",
+    pass: true,
+    hard: true,
+    detail: `${contracts.shots.length} 个本次结构化原生镜头卡已绑定`,
+  }];
+  const ids = new Set<string>();
+  let totalBytes = 0;
+  for (const [index, raw] of contracts.shots.entries()) {
+    const shot = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    const id = typeof shot.shotId === "string" && shot.shotId.trim() ? shot.shotId
+      : typeof shot.shot_id === "string" && shot.shot_id.trim() ? shot.shot_id : `index-${index + 1}`;
+    const prompt = typeof shot.prompt === "string" ? shot.prompt : "";
+    const bytes = Buffer.byteLength(JSON.stringify({ shotId: id, prompt, fields: shot.fields ?? null }));
+    totalBytes += bytes;
+    const unique = !ids.has(id);
+    ids.add(id);
+    checks.push({
+      id: `prompt-shape:${id}`,
+      pass: unique && Boolean(prompt.trim()) && Boolean(shot.fields && typeof shot.fields === "object" && !Array.isArray(shot.fields)),
+      hard: true,
+      detail: `${id}: ${unique ? "唯一" : "重复"}，prompt=${prompt.length} 字符，fields=${shot.fields && typeof shot.fields === "object" ? Object.keys(shot.fields).length : 0} 项`,
+    });
+    checks.push({
+      id: `prompt-length:${id}`,
+      pass: prompt.length >= NATIVE_PROMPT_MIN_CHARS && prompt.length <= NATIVE_PROMPT_MAX_CHARS,
+      hard: true,
+      detail: `${id}: 最终原生 prompt ${prompt.length} 字符（允许 ${NATIVE_PROMPT_MIN_CHARS}-${NATIVE_PROMPT_MAX_CHARS} UTF-16）`,
+    });
+    checks.push({
+      id: `prompt-bytes:${id}`,
+      pass: bytes <= PROMPT_PACKAGE_MAX_BYTES,
+      hard: true,
+      detail: `${id}: 镜头 prompt+fields JSON ${bytes} 字节（上限 ${PROMPT_PACKAGE_MAX_BYTES}）`,
+    });
+  }
+  checks.push({
+    id: "prompt-package-bytes",
+    pass: totalBytes <= PROMPT_PACKAGE_MAX_BYTES,
+    hard: true,
+    detail: `本次 G6 结构化 prompt 包 ${totalBytes} 字节（上限 ${PROMPT_PACKAGE_MAX_BYTES}）`,
+  });
+  return checks;
+}
+
+/**
+ * Global kill switch for policy-based auto-approval. The default is enforce;
+ * `PIPELINE_SYSTEM_AUTO_APPROVAL=off` blocks review-capable actions instead of
+ * creating a human approval row or a pending_review task.
+ */
+export function systemAutoApprovalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return loadPipelineFeatureFlags(env).systemAutoApproval === "enforce";
+}
+
+export function renderSubmitAutoAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return systemAutoApprovalEnabled(env);
+}
+
+/** review=AI 监制输入，auto=只保留确定性检查；二者都必须再经版本化策略。 */
+export type ProducerMode = "review" | "auto";
+
+export function producerModeFromEnv(env: NodeJS.ProcessEnv = process.env): ProducerMode {
+  const raw = (env.HR_PRODUCER ?? "review").trim().toLowerCase();
+  return raw === "auto" ? "auto" : "review";
+}
+
+/** 门 → 监制评审环节（决定默认评审要点；`producer-gate` 里定义） */
+export const GATE_PRODUCER_STAGE: Partial<Record<GateKey, ProducerStage>> = {
+  G1_DOSSIER: "script",
+  G2_THEME: "script",
+  G3_INSIGHT: "script",
+  G4_PRD: "prompt",
+  G5_PORTRAIT: "keyframe",
+  G6_PROMPT: "prompt",
+  G7_FINAL: "prompt",
+};
+
+/** 逐门评审要点（在通用 rubric 之上叠加该门的专属口径） */
+export const GATE_RUBRIC: Partial<Record<GateKey, string[]>> = {
+  G1_DOSSIER: ["逐条核对facts中的原文引用和支持关系评审，档案/摘要卡不能新增未经claims支持的事实，用户输入不是事实来源",
+    "A2/A3没有证据时必须保留明确用途限制；无证据不等于负面结论，不允许创造用户口碑、竞品对比或数字主张",
+    "商品型号/价格时点/计量单位与来源一致，来源冲突必须拒绝；与项目主题相关，不含无关行业商品"],
+  G2_THEME: ["主题/受众/时长/画幅与需求一致", "不出现与主题无关的红线意象（科幻/微观/无关地域）"],
+  G3_INSIGHT: ["需求对齐清单覆盖角色/场景/道具/动作四类契约", "受众与风险项有具体结论，不是占位文字"],
+  G4_PRD: ["角色系统有可执行的外观锚点（定妆照前置）", "交付标准可验证（画幅/时长/音频/字幕口径）"],
+  G5_PORTRAIT: ["定妆照必须真出图（completedPortraits>0），不接受只有规格包的 pending 状态", "必需角度 front/threeQuarter/closeup/side 齐备", "人物与角色档案一致（授权真人须与本人照片同一张脸）"],
+  G6_PROMPT: ["每镜提示词达到交付口径（≥1200 字）且 25/30 字段齐备", "台词速率与占比合规，无红线词"],
+  G7_FINAL: ["预生产收口：镜头卡/定妆照/提示词三件套齐备且互相引用一致", "渲染提交前的花额度动作仍需人审（本门只放行内部准备）"]
+};
+
+/** Approved suggestions are review annotations, not permission to mutate an approved artifact. */
+export function appliedApprovalFeedback(approved: boolean, suggestions: unknown): string[] {
+  if (approved || !Array.isArray(suggestions)) return [];
+  return suggestions.filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+}
+
+function scanWithoutInitialCandidateParent(text: string): string {
+  const selection = currentCreativeSelectionContext()?.trimEnd();
+  // The current runtime owns the appended source. A lookalike or modified
+  // suffix in customer/vendor prose must not receive the exception.
+  if (!selection || !text.endsWith(selection)) return text;
+  const jsonStart = selection.lastIndexOf("\n") + 1;
+  try {
+    const envelope = JSON.parse(selection.slice(jsonStart)) as { assessment?: { shots?: Array<{
+      schemaVersion?: unknown; revision?: unknown; parentHash?: unknown;
+    }> } } | null;
+    const shots = envelope?.assessment?.shots;
+    if (!Array.isArray(shots)) return text;
+    for (const shot of shots) {
+      if (shot?.schemaVersion === "workloom.creative-shot/v1" && shot.revision === 1 && shot.parentHash === null) {
+        shot.parentHash = "";
+      }
+    }
+    // Use only the scan copy. The full approval artifact, digest and model
+    // evidence still use the original candidate and all of its bytes.
+    return text.slice(0, -selection.length) + selection.slice(0, jsonStart) + JSON.stringify(envelope);
+  } catch { return text; }
+}
+
+/**
+ * 门内容的确定性检查（零 token 先判）：
+ * 空内容 / 占位符 / 声称完成但没有产物 —— 一律硬失败，不浪费模型额度。
+ */
+export function gateDeterministicChecks(gate: GateKey, content: string): Array<{ id: string; pass: boolean; detail: string; hard?: boolean }> {
+  const text = content ?? "";
+  const trimmed = text.trim();
+  if (gate === "G1_DOSSIER") {
+    let valid = false;
+    try {
+      const value = JSON.parse(trimmed) as { facts?: { schemaVersion?: string; stages?: unknown[]; sources?: unknown[] } };
+      valid = value.facts?.schemaVersion === "workloom.marketing-facts/v1" && value.facts.stages?.length === 3
+        && Array.isArray(value.facts.sources) && value.facts.sources.length > 0;
+    } catch { valid = false; }
+    return [{ id: "marketing-facts-present", pass: valid, hard: true,
+      detail: valid ? "完整本次来源/三站事实包可解析；null等JSON值不会当作占位词误杀" : "G1必须读取宿主本次完整来源事实包" }];
+  }
+  const hardPlaceholder = /undefined|NaN|\[object Object\]/.test(trimmed);
+  const nullScan = gate === "G2_THEME" || gate === "G4_PRD" ? scanWithoutInitialCandidateParent(trimmed) : trimmed;
+  // Gate documents embed versioned JSON contracts whose schemas legitimately
+  // use null for optional fields. Ignore `null` only inside a parseable fenced
+  // JSON block; prose or broken JSON still fails closed.
+  const placeholderScan = gate === "G3_INSIGHT" ? "" : nullScan.replace(
+    /```json\s*([\s\S]*?)```/gi,
+    (block, body: string) => {
+      try {
+        JSON.parse(body.trim());
+        return "";
+      } catch {
+        return block;
+      }
+    },
+  );
+  /**
+   * Some legacy Markdown renderers stringify a schema's optional field as
+   * `hero_image_id 为 null` even when the structured object is valid. These
+   * keys are explicitly nullable host contracts; only those exact prose forms
+   * are exempt. Unknown keys, malformed JSON and generic "字段值为 null"
+   * remain hard failures.
+   */
+  const protocolNullProse = placeholderScan.replace(
+    /\b(?:hero_image_id|protagonist|character_consistency)\s*(?:[:：=]|为)\s*null\b/gi,
+    "",
+  );
+  const nullPlaceholder = /\bnull\b/i.test(protocolNullProse);
+  const placeholder = hardPlaceholder || nullPlaceholder;
+  const checks = [
+    { id: "content-present", pass: trimmed.length > 0, hard: true, detail: trimmed.length > 0 ? `门内容 ${trimmed.length} 字` : "门内容为空（vendor 未产出该环节产物）" },
+    { id: "no-placeholder", pass: !placeholder, hard: true, detail: placeholder ? "门内容含 undefined/null/NaN/[object Object] 占位" : "无占位符泄漏（可解析版本化合同的协议 null 不算占位）" },
+    { id: "min-length", pass: trimmed.length >= 120, hard: true, detail: `内容长度 ${trimmed.length}（下限 120，过短通常意味着上游字段过薄）` }
+  ];
+  if (gate === "G5_PORTRAIT") {
+    const pendingOnly = /completedPortraits["'\s:]+0/.test(trimmed) || /"pending"\s*:\s*true/.test(trimmed);
+    checks.push({ id: "portrait-produced", pass: !pendingOnly, hard: true, detail: pendingOnly ? "定妆照仍是 pending / completedPortraits=0（只有规格包，未真出图）" : "定妆照有实际出图记录" });
+    const angles = ["front", "threeQuarter", "closeup", "side"];
+    const missing = angles.filter((a) => !trimmed.includes(a) && !trimmed.includes(a.toLowerCase().replace("threequarter", "three_quarter")));
+    checks.push({ id: "required-angles", pass: missing.length === 0, hard: missing.length >= 3, detail: missing.length === 0 ? "必需角度齐备" : `门内容未提到角度：${missing.join("/")}` });
+  }
+  return checks;
+}
+
+/**
+ * 把门内容落盘成**真实文件**再送给 AI 监制（T-2026-0925-0002 真机根因）。
+ *
+ * 为什么必须有：`reviewStage` 的正文是从 `artifacts[].path` **读文件**的；
+ * 此前服务端传的是 `${gate}:${vendorType}` 这种"标签路径"（不是文件），监制读不到 →
+ * 只剩 rubric 里 600 字摘录 → 门内容后半段（需求契约、结论摘要、弧线收束…）等于不存在，
+ * 于是反复出现"契约缺失/结论缺失"的误杀（真机 VID-AUDIT-M3/M4/M6 连续三轮）。
+ *
+ * 纪律：写盘只是把**同一份门内容**交给评审，不新增/不裁剪语义；文件名带 gate 与序号便于审计。
+ */
+export function writeGateArtifact(
+  workDir: string,
+  projectId: string,
+  gate: string,
+  contentMd: string,
+): { path: string; chars: number } {
+  const dir = join(workDir, "gates", projectId);
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${gate}.md`);
+  writeFileSync(file, contentMd ?? "", "utf8");
+  return { path: file, chars: (contentMd ?? "").length };
+}
+
+/**
+ * 判断一次预生产结果是否属于「AI 监制打回（内部门不合格）」。
+ *
+ * 用途：门语义是"打回重跑"，而不是"打回停线"（`docs/pipeline-stages-and-gates-2026-09-24.md`
+ * 里 CLI 侧就是逐环节重跑）。宿主据此做**有上限的自动重跑**，超限才停线并上报。
+ */
+export function isProducerRejection(result: {
+  success?: boolean;
+  confirmations?: Record<string, unknown>;
+}): boolean {
+  if (result?.success) return false;
+  const confirmations = result?.confirmations ?? {};
+  return Object.values(confirmations).some((value) => {
+    const record = (value && typeof value === "object") ? value as Record<string, unknown> : null;
+    if (!record || record.approved !== false) return false;
+    const reason = String(record.reason ?? "");
+    return reason.includes("producer-rejected") || reason.includes("producer_unavailable");
+  });
+}
+
+
+/** G5 的事实由本次引擎结构结果与真实索引/图片共同给出；不从确认单里的自述推断出图。 */
+export function portraitGateEvidence(input: {
+  workDir: string; projectId: string; stage: unknown; scriptReport: unknown;
+}): { artifacts: ProducerArtifact[]; deterministic: DeterministicCheck[]; notApplicable: boolean } {
+  const stage = input.stage && typeof input.stage === "object" ? input.stage as Record<string, unknown> : {};
+  const report = input.scriptReport && typeof input.scriptReport === "object" ? input.scriptReport as Record<string, unknown> : {};
+  if (stage.status === "skipped" && stage.reason === "no-characters-or-products" && report.characters_count === 0) {
+    return { artifacts: [], notApplicable: true, deterministic: [{ id: "portrait-applicability", status: "not_applicable", pass: false, hard: true,
+      detail: "本次剧本结构 characters_count=0 且 PortraitStudio 无角色/商品任务" }] };
+  }
+  const fail = (detail: string) => ({ artifacts: [], notApplicable: false,
+    deterministic: [{ id: "portrait-files", pass: false, hard: true, detail }] });
+  try {
+    if (stage.status !== "completed" || !(Number(stage.completedPortraits) > 0) || Number(stage.pendingPortraits) !== 0) return fail("本次定妆照未完整生成，不能用旧图片或计划书代替");
+    const base = realpathSync(input.workDir);
+    const root = resolve(base, "characters", input.projectId);
+    if (!root.startsWith(`${base}${sep}`) || realpathSync(root) !== root) return fail("定妆照目录越界或经过符号链接");
+    const indexPath = join(root, "portrait-index.json");
+    if (realpathSync(indexPath) !== indexPath) return fail("定妆照索引经过符号链接");
+    const index = JSON.parse(readFileSync(indexPath, "utf8")) as PortraitIndex;
+    if (index.schemaVersion !== "workloom.portrait-index/v1" || index.projectId !== input.projectId) return fail("定妆照索引不属于当前项目");
+    const characters = Object.values(index.characters ?? {}), products = Object.values(index.products ?? {});
+    if (characters.length !== Number(stage.characters) || products.length !== Number(stage.products)) return fail("实际定妆照主体数与本次生成任务不一致");
+    const artifacts: ProducerArtifact[] = [{ path: indexPath, kind: "json", note: "本次实际角色/商品及角度索引" }];
+    for (const item of [...characters, ...products]) {
+      const entries = Object.entries(item.files ?? {});
+      if (item.kind === "character" && ["front", "threeQuarter", "closeup", "side"].some(angle => !item.files?.[angle])) return fail(`角色 ${item.id} 缺少必需的四角度`);
+      if (entries.length === 0) return fail("主体没有实际出图文件");
+      for (const [angle, file] of entries) {
+        const absolute = resolve(base, relative(resolve(input.workDir), resolve(file)));
+        if (!absolute.startsWith(`${root}${sep}`) || realpathSync(file) !== absolute || !statSync(absolute).isFile() || statSync(absolute).size === 0) return fail("定妆照文件缺失、为空、越界或经过符号链接");
+        artifacts.push({ path: absolute, kind: "image", note: `${item.kind}:${item.id}:${angle}` });
+      }
+    }
+    if (artifacts.length === 1) return fail("定妆照索引没有可送审图片");
+    return { artifacts, notApplicable: false, deterministic: [
+      { id: "portrait-files", pass: true, hard: true, detail: `${artifacts.length - 1} 张当前项目图片已读取并与本次任务数量核对` },
+      { id: "required-angles", pass: true, hard: true, detail: "所有人物四角度完整，商品有实际视图" },
+    ] };
+  } catch (error) { return fail(`实际定妆照证据不可读取：${error instanceof Error ? error.message : String(error)}`); }
+}
+
+/** 把本次实际产出整理成可审计清单，供系统策略和人工复核共用。 */
+export function portraitReviewManifest(input: { workDir: string; projectId: string }): {
+  markdown: string;
+  files: Array<{ subject: string; angle: string; file: string; sha256: string; bytes: number }>;
+} {
+  const base = realpathSync(input.workDir);
+  const root = resolve(base, "characters", input.projectId);
+  const indexPath = join(root, "portrait-index.json");
+  if (!existsSync(indexPath)) {
+    return {
+      markdown: "## 定妆照人工验收\n\n（未找到 portrait-index.json，无法列出本次定妆照文件；请先确认定妆照阶段已执行）",
+      files: [],
+    };
+  }
+  const index = JSON.parse(readFileSync(indexPath, "utf8")) as PortraitIndex;
+  const files: Array<{ subject: string; angle: string; file: string; sha256: string; bytes: number }> = [];
+  for (const item of [...Object.values(index.characters ?? {}), ...Object.values(index.products ?? {})]) {
+    const subject = `${item.kind === "character" ? "角色" : "商品"} ${item.id ?? "(未命名)"}`;
+    for (const [angle, file] of Object.entries(item.files ?? {})) {
+      const raw = resolve(input.workDir, file);
+      if (!existsSync(raw) || !statSync(raw).isFile()) continue;
+      /** 清单只展示落在本项目定妆照目录内的文件（realpath 归一再判，越界/符号链接一律不列） */
+      const absolute = realpathSync(raw);
+      if (!absolute.startsWith(`${root}${sep}`)) continue;
+      const bytes = statSync(absolute).size;
+      const sha256 = createHash("sha256").update(readFileSync(absolute)).digest("hex");
+      files.push({ subject, angle, file: absolute, sha256, bytes });
+    }
+  }
+  const lines = [
+    "## 定妆照系统裁决证据清单",
+    "",
+    `本次实际产出 ${files.length} 张：`,
+    "",
+    ...files.map((entry) => `- ${entry.subject}（${entry.angle}）：${entry.file}（${(entry.bytes / 1024).toFixed(0)}KB，sha256 ${entry.sha256.slice(0, 12)}…）`),
+    "",
+    "口径：逐张文件与摘要进入版本化系统策略；文件缺失、角度不足或来源不符时失败关闭。",
+  ];
+  return { markdown: lines.join("\n"), files };
+}

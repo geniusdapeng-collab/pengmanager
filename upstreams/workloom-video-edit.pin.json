@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/geniusdapeng-collab/WorkLoom-video-edit",
+  "commit": "a544ab8b068790bfb14b7977efc81b33897fc9de",
+  "tree": "2f1a5835d4363496efd692fd4434506e28254e70",
+  "engineRoot": "engines/video-edit",
+  "sourceFileCount": 3650,
+  "distribution": "public-source",
+  "snapshot": "upstreams/workloom-video-edit.snapshot.json",
+  "snapshotSha256": "14028d1b00a67712cff88b549a2f719128690948ddd1e4a36ba9b3668bf5a3c4",
+  "capabilityCatalog": "engines/video-edit/pengmanager-capabilities.json"
+}

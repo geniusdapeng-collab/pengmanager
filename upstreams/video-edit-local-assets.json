@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "pengmanager.video-local-assets/v1",
+  "sourceRepository": "geniusdapeng-collab/WorkLoom-video-edit",
+  "sourceCommit": "a544ab8b068790bfb14b7977efc81b33897fc9de",
+  "scope": "public-embedded-asset-integrity",
+  "workloomActivationGranted": false,
+  "assetCount": 441,
+  "digest": "3d02cfccfbde506de097c1874d8498e1a4b07fa30e7bd171aeb97b3d82c1b60f",
+  "omittedAssetCountsByGroup": {
+    "library": 206
+  }
+}

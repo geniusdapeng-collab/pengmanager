@@ -1,0 +1,1886 @@
+/**
+ * video/studio-worker.ts —— 预生产运行工作器（融合设计 §3 门矩阵 G1–G7 接线）
+ *
+ * 职责：
+ *  1. 内存 run 注册表（runId → 运行投影），studio.start 异步启动不阻塞 tRPC 响应
+ *  2. onApproval：确认门 → gatewayAppendOnClient 落门动作事件 + INSERT approvals（pending）
+ *     → 轮询审批状态（HR_APPROVAL_POLL_MS / HR_APPROVAL_TIMEOUT_MS）→ 映射 GateVerdict
+ *  3. onEvent：pipeline.* 生命周期事件经 gatewayAppend 落五元事件库
+ *  4. LLM engine：WorkloomLLMEngine.fromEnv()；为 null 拒绝启动（禁止静默降级，vendor 纪律）
+ *
+ * 纪律：门事件与 approvals 行同一事务同一 COMMIT（D16）；事件一律经 workdata 安全网关。
+ * 注意：ApprovalCallback 签名（packages/video-studio，冻结）不透传 vendor 的 shouldAbort，
+ *      本工作器以 run 注册表 aborted 位实现同等中止语义（轮询每拍检查）。
+ */
+import path from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { getAppPool, getGatewayPool } from "@workloom/db";
+import { GatewayEventSink, poolFromEnv } from "@workloom/base/model-router";
+import { modelPolicyFor } from "../service/llm.js";
+import { gatewayAppend, gatewayAppendOnClient, insertWithReadableId, VIDEO_PROJECT_ID_SOURCE } from "@workloom/base/workdata";
+import { makeReadableId, newId } from "@workloom/shared";
+import {
+  VideoStudio,
+  WorkloomLLMEngine,
+  ArchiveStore,
+  StageRunner,
+  auditScenePolicy,
+  attachStructuredLog,
+  bindExplicitAudienceMetadata,
+  classifyError,
+  type DeterministicCheck,
+  type CreativeContract,
+  installVendorEngineBridge,
+  installVendorPortraitBindingBridge,
+  installVendorRenderCompatBridge,
+  resolveVideoModel,
+  reviewStage,
+  updateContextBundle,
+  type ApprovalCallback,
+  type EventSink,
+  type GateKey,
+  type GateVerdict,
+  type PipelineKind,
+  type PortraitIndex,
+  type ProducerArtifact,
+  type ProducerStage,
+  type ProducerVerdict,
+  type RunInput,
+  type ScenePolicyException,
+  type ScenePolicyShot,
+  type StudioConfig,
+  type StudioPortraitConfig,
+  creativeFactsFromG1,
+  extractProductVisualAuthority,
+  type PrdMarketingAuthority,
+  videoTextEndpointFromEnv,
+  withCreativeBudget,
+} from "@hyperreality/video-studio";
+import { buildServerGateRecord, withGateLedger } from "./gate-ledger-bridge.js";
+import { createDataMiningExecutor } from "./data-mining-executor.js";
+import { prepareMarketingFacts, finalizeMarketingFacts, toJennyMarketingRaw, type PreparedMarketingFacts } from "./marketing-authority.js";
+import { createMarketingGateEvidenceGuard } from "./marketing-gate-evidence.js";
+import { canonicalRenderJson, renderSha256 } from "./gen/compiled-request.js";
+import { acceptPortraitArchiveReuse, loadPortraitReuseManifest, portraitReuseEvidence, type PortraitArchiveReuseAcceptance } from "./portrait-reuse-acceptance.js";
+import { applyBuiltinCharacters, appendBuiltinCharacterGuidance, resolveBuiltinCharacters, type BuiltinCharacterResolution } from "./builtin-character-selection.js";
+import { acquireProjectLease, archiveWorkDir, makeLedgerWriter, readProjectMeta } from "./archive-host.js";
+import { ingestPortraitsFromIndex } from "./media/library.js";
+import { upsertProductProfileFromDossier } from "./media/products.js";
+import { resolveProductionProductReferences, resolveStudioProductReferences, type ProductionProductReference } from "./studio-product-references.js";
+import { appendScenePolicyGuidance, resolveScenePolicyForIntent } from "./scene-policy-routing.js";
+import { appendPlatformGuidance, resolvePlatformForIntent } from "./platform-routing.js";
+import { loadVideoPipelinePlan, type CompiledVideoPipelinePlan } from "@hyperreality/video-pipeline";
+import { PipelineShadowObserver, pipelineControlMode } from "./pipeline/shadow.js";
+import { assertNoCreativePendingUsage, createCreativeExecutionSession, verifyCreativeMarketingSource } from "./creative-service.js";
+import { runEarlyCreativeCandidates } from "./creative-api-service.js";
+import { withCreativeExternalBudget, guardedCreativeExternalCall as dispatchCreativeExternalCall } from "./creative-external-budget.js";
+import { observeCreativeShadow } from "./creative-shadow.js";
+import { createCreativeShotQualityReviewer } from "./creative-shot-quality.js";
+import { assertCreativeConfigurationReady } from "./creative-config.js";
+import {
+  AUTO_GATES,
+  GATE_PRODUCER_STAGE,
+  GATE_RUBRIC,
+  gateDeterministicChecks,
+  isProducerRejection,
+  producerModeFromEnv,
+  portraitGateEvidence,
+  promptPackageGateChecks,
+  systemAutoApprovalEnabled,
+  writeGateArtifact,
+  type ProducerMode,
+} from "./gate-policy.js";
+import {
+  evaluateVideoSystemAutoApproval,
+  VIDEO_SYSTEM_AUTO_APPROVAL_POLICY,
+} from "@hyperreality/video-pipeline";
+import { loadPipelineFeatureFlags, type AutoApprovalCheck } from "@workloom/pipeline-control";
+
+/* ================= 可配项（环境变量） ================= */
+
+/** 审批等待上限（默认 2 小时；超时 → { approved:false, fatal:'timeout' }） */
+const APPROVAL_TIMEOUT_MS = Number(process.env.HR_APPROVAL_TIMEOUT_MS ?? 7_200_000);
+/** 审批状态轮询间隔（默认 2s） */
+const APPROVAL_POLL_MS = Number(process.env.HR_APPROVAL_POLL_MS ?? 2_000);
+/** 流水线总截止（透传 vendor STORMAXE_TOTAL_DEADLINE_MS 口径，默认 1 小时） */
+const TOTAL_DEADLINE_MS = Number(process.env.VM_TOTAL_DEADLINE_MS ?? 3_600_000);
+
+/**
+ * 内部门与逐门口径见 `./gate-policy.js`。视频门不再生成 approvals 或
+ * pending_review；统一由版本化系统策略输出 passed/repair/blocked。
+ */
+const PRODUCER_MODE: ProducerMode = producerModeFromEnv();
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+/** 仓库根（apps/server/src/video → 上溯四级）：参考图相对路径按此解析 */
+const REPO_ROOT = path.resolve(here, "../../../..");
+/**
+ * 运行产物根（checkpoints/characters/confirmations/archive）：默认仓库根 `.vm-work/`。
+ * 与 archive-watch / archive-resume CLI 共用 `archiveWorkDir()` 解析（相对路径按仓库根，
+ * 历史 cwd 相对路径自动兼容），避免"服务器写一处、巡检读另一处"的路径漂移。
+ */
+const WORK_DIR = archiveWorkDir();
+
+/**
+ * 营销路由判定 → 情报层装配开关（2026-09-25 激活）。
+ *
+ * 判定与 vendor 的激活条件同源（`metadata.dataMining` / `metadata.brief.product`），
+ * 另接受 `metadata.pipelineRoute.kind === 'marketing'`（分流器的落库口径）与 `products[]`
+ * （产品所有者给的实拍图登记）。命中即为本次 run 装配**真实检索执行器**：
+ *   - 情报五站由 api 模式的 executor 真跑（Bing 公开 RSS + 模型结构化回填）；
+ *   - 档案落盘按工作区隔离：`<WORK_DIR>/dossiers/<workspaceId>`；
+ *   - 未命中（叙事片）保持原行为，vendor 不会进情报层。
+ */
+function dataMiningConfigFor(
+  metadata: Record<string, unknown> | undefined,
+  llm: WorkloomLLMEngine,
+  workspaceId: string,
+): StudioConfig["dataMining"] | undefined {
+  if ((process.env.VM_DATA_MINING ?? "1") === "0") return undefined;
+  const dm = metadata?.dataMining as { name?: unknown } | undefined;
+  const brief = metadata?.brief as { product?: unknown } | undefined;
+  const route = metadata?.pipelineRoute as { kind?: unknown } | undefined;
+  const products = metadata?.products;
+  const marketing = Boolean(
+    (dm && typeof dm.name === "string" && dm.name.trim())
+    || (brief && typeof brief.product === "string" && brief.product.trim())
+    || route?.kind === "marketing"
+    || (Array.isArray(products) && products.length > 0),
+  );
+  if (!marketing) return undefined;
+  const mode = (process.env.VM_DATA_MINING_MODE ?? "api").trim() === "spec" ? "spec" : "api";
+  return {
+    mode,
+    ...(mode === "api"
+      ? {
+          // vendor 侧按 `executor(stage, plan)` 调用（stage 为 A1/A2/A3），此处收敛为宿主类型
+          executor: createDataMiningExecutor({
+            llm,
+            log: (line) => console.log(line),
+            // Preserve keyless search results across retries and allow an owner-reviewed
+            // search/import handoff without weakening source fetch or claim verification.
+            searchCacheFile: path.join(WORK_DIR, "search-cache", `${workspaceId}.json`),
+          }) as unknown as (
+            stage: string,
+            plan: Record<string, unknown>,
+          ) => Promise<Record<string, unknown> | null>,
+        }
+      : {}),
+    refresh: (process.env.VM_DATA_MINING_REFRESH ?? "") === "1",
+    storeRoot: path.join(WORK_DIR, "dossiers", workspaceId),
+    staleAfterDays: Number(process.env.VM_DATA_MINING_STALE_DAYS ?? 30) || 30,
+  };
+}
+
+/**
+ * 运行日志 tee（2026-09-22 真机审计需求）：
+ * 预生产的 vendor 环节日志此前只进服务端 stdout（TTY），run 结束即丢，事后无法逐环节审计。
+ * 这里在 run 期间把 console 输出旁路落盘到 `.vm-work/logs/<projectId>.log`（原样透传，不改语义），
+ * 供 `scripts/tools/pipeline-audit.mts` 逐环节核对"是否正常产出/是否流转".
+ */
+/**
+ * C-07 修复：全局 console 劫持改为"单一包装 + 订阅者引用计数"。
+ * 此前每个 run 各自捕获"当前"console 为 originals——并发两个 run 时 B 捕获的是 A 的包装器，
+ * A 先结束恢复后，B 结束会把 console 永久还原成 A 的包装器（日志继续写入已结束 run 的文件，
+ * 且后续 run 的恢复链彻底错位）。
+ * 现在：console 只被包装一次（真正 originals 只捕获一次），各 run 以订阅者身份注册自己的
+ * 日志文件，取消订阅时引用计数归零才还原 console——先后结束顺序任意都不错位。
+ */
+const teeSubscribers = new Map<string, (level: string, args: unknown[]) => void>();
+let teeInstalled: { originals: Array<(...args: unknown[]) => void> } | null = null;
+
+function formatTeeLine(args: unknown[]): string {
+  return args
+    .map((a) => (typeof a === "string" ? a : a instanceof Error ? `${a.name}: ${a.message}` : (() => {
+      try {
+        return JSON.stringify(a);
+      } catch {
+        return String(a);
+      }
+    })()))
+    .join(" ");
+}
+
+function installTee(): void {
+  if (teeInstalled) return;
+  const methods = ["log", "warn", "error"] as const;
+  const originals = methods.map((m) => console[m] as (...args: unknown[]) => void);
+  methods.forEach((m, i) => {
+    (console as unknown as Record<string, unknown>)[m] = (...args: unknown[]) => {
+      for (const write of teeSubscribers.values()) {
+        try {
+          write(m.toUpperCase(), args);
+        } catch {
+          /* 单个订阅者失败不影响其他订阅者与原输出 */
+        }
+      }
+      originals[i]!.apply(console, args);
+    };
+  });
+  teeInstalled = { originals };
+}
+
+function uninstallTeeIfIdle(): void {
+  if (!teeInstalled || teeSubscribers.size > 0) return;
+  const methods = ["log", "warn", "error"] as const;
+  methods.forEach((m, i) => {
+    (console as unknown as Record<string, unknown>)[m] = teeInstalled!.originals[i];
+  });
+  teeInstalled = null;
+}
+
+function teeRunLogs(projectId: string): () => void {
+  const logDir = path.join(WORK_DIR, "logs");
+  const logFile = path.join(logDir, `${projectId}.log`);
+  try {
+    mkdirSync(logDir, { recursive: true });
+  } catch {
+    return () => undefined;
+  }
+  const write = (level: string, args: unknown[]) => {
+    try {
+      appendFileSync(logFile, `[${new Date().toISOString()}] ${level} ${formatTeeLine(args)}\n`, "utf8");
+    } catch {
+      /* 日志落盘失败不影响运行 */
+    }
+  };
+  teeSubscribers.set(projectId, write);
+  installTee();
+  let released = false;
+  return () => {
+    if (released) return; // 幂等：重复调用不破坏其他 run 的订阅
+    released = true;
+    teeSubscribers.delete(projectId);
+    uninstallTeeIfIdle();
+  };
+}
+
+/** 工作器系统身份（事件归因；网关段① human/system 无额外校验） */
+const WORKER_ACTOR = { id: "video-studio", type: "system" } as const;
+
+/**
+ * 软失败原因提取（T-2026-0926-0005）：vendor 返回 `success:false` 但不抛异常时，
+ * 注册表 `entry.error` 往往是空串——`?? 兜底` 会落成空消息并被分类成 BUG。
+ * 取因顺序：运行器异常 → result.error/errorMessage → vendor failures/errors → 被拒确认门 → 通用兜底。
+ */
+export function terminalFailureMessageOf(result: unknown, entryError?: string | null): string {
+  const r = (result ?? {}) as {
+    error?: unknown;
+    errorMessage?: unknown;
+    failures?: Array<{ message?: unknown }>;
+    errors?: Array<{ message?: unknown; error?: unknown }>;
+    confirmations?: Record<string, unknown>;
+  };
+  const candidates: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value === "string" && value.trim()) candidates.push(value.trim());
+  };
+  push(entryError);
+  push(r.error);
+  push(r.errorMessage);
+  if (Array.isArray(r.failures)) for (const failure of r.failures) push(failure?.message);
+  if (Array.isArray(r.errors)) for (const failure of r.errors) push(failure?.message ?? failure?.error);
+  for (const confirmation of Object.values(r.confirmations ?? {})) {
+    if (confirmation && typeof confirmation === "object") {
+      const verdict = confirmation as { approved?: unknown; reason?: unknown };
+      if (verdict.approved === false) push(verdict.reason);
+    }
+  }
+  return (candidates[0] ?? "vendor 返回 success:false").slice(0, 500);
+}
+
+/** Only the final native result carries complete cards; stage shots are a lossy summary. */
+function completePreproductionShots(result: Awaited<ReturnType<VideoStudio["runPreproduction"]>>): Array<Record<string, unknown>> {
+  const fail = (detail: string): never => { throw new Error(`PREPRODUCTION_HANDOFF_INVALID: ${detail}`); };
+  if (result.degraded === true) fail("本次原生制作已降级，不能签出正式 CLI 草稿");
+  if (!Array.isArray(result.shots) || !result.shots.length) fail("缺少本次完整 result.shots；阶段摘要不能替代原始镜头");
+  const seen = new Set<string>();
+  const shots: Array<Record<string, unknown>> = (result.shots as unknown[]).map((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return fail(`第 ${index + 1} 镜不是完整对象`);
+    const shot = value as Record<string, unknown>, id = shot.shotId ?? shot.shot_id;
+    if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) || id.includes("..") || seen.has(id)
+      || (shot.shotId !== undefined && shot.shot_id !== undefined && shot.shotId !== shot.shot_id)) return fail(`第 ${index + 1} 镜镜号无效、重复或互相冲突`);
+    if (typeof shot.duration !== "number" || !Number.isFinite(shot.duration) || shot.duration <= 0) fail(`镜头 ${id} 缺少原始正数时长`);
+    if (typeof shot.prompt !== "string" || !shot.prompt.trim()) fail(`镜头 ${id} 缺少完整原始 prompt`);
+    if (!shot.fields || typeof shot.fields !== "object" || Array.isArray(shot.fields) || !Object.keys(shot.fields).length) fail(`镜头 ${id} 缺少完整原始 fields`);
+    if (shot.degraded === true || shot.status === "degraded") fail(`镜头 ${id} 已降级`);
+    seen.add(id);
+    // No casts, dialogue, policy tags, durations or creative fields are inferred here.
+    return { ...structuredClone(shot), shotId: id };
+  });
+  if (!Number.isFinite(shots.reduce((sum, shot) => sum + Number(shot.duration), 0))) fail("完整原始镜头总时长不是有效数值");
+  canonicalRenderJson(shots); // Reject values that JSON cannot faithfully preserve before writing.
+  return shots;
+}
+
+/* ================= run 注册表 ================= */
+
+export type RunStatus = "running" | "awaiting_approval" | "finished" | "failed";
+
+export interface RunEntry {
+  runId: string;
+  projectId: string;
+  workspaceId: string;
+  status: RunStatus;
+  /** 当前待审批门（无待审批为 null） */
+  currentGate: GateKey | null;
+  /** 当前待审批单号（G8 队列可直查） */
+  pendingApprovalId: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  error: string | null;
+  resultSummary: Record<string, unknown> | null;
+  /** shouldAbort 位：置 true 后轮询下一拍中断（见文件头说明） */
+  aborted: boolean;
+}
+
+const runs = new Map<string, RunEntry>();
+
+/** run 投影（studio.status 数据源；L7.1：跨工作区查询返回 null） */
+export function getRun(runId: string, workspaceId: string): RunEntry | null {
+  const entry = runs.get(runId);
+  if (!entry || entry.workspaceId !== workspaceId) return null;
+  return entry;
+}
+
+/** 工作区 run 聚合（studio.active 数据源：只读内存投影，不改变任何运行语义） */
+export interface WorkspaceRunSummary {
+  /** 正在执行的 run 数 */
+  running: number;
+  /** 停在人审门上的 run 数 */
+  awaitingApproval: number;
+  /** 最近失败（窗口内）的 run 数 */
+  failedRecent: number;
+  /** 活跃 run 的编号（running + awaitingApproval，供 UI 深链） */
+  activeRunIds: string[];
+}
+
+/**
+ * 汇总本工作区 run 状态（供「织伴」全局状态球与运维面板使用）。
+ * 语义边界：run 注册表是**进程内**投影（服务重启即清空），这里只做只读汇总，
+ * 不写库、不改变 run 生命周期；失败窗口默认 15 分钟（够一次 10s/20s 轮询看见）。
+ */
+export function summarizeWorkspaceRuns(
+  workspaceId: string,
+  options: { now?: number; failedWindowMs?: number } = {},
+): WorkspaceRunSummary {
+  const now = options.now ?? Date.now();
+  const failedWindowMs = options.failedWindowMs ?? 15 * 60_000;
+  const summary: WorkspaceRunSummary = { running: 0, awaitingApproval: 0, failedRecent: 0, activeRunIds: [] };
+  for (const entry of runs.values()) {
+    if (entry.workspaceId !== workspaceId) continue;
+    if (entry.status === "running") {
+      summary.running += 1;
+      summary.activeRunIds.push(entry.runId);
+    } else if (entry.status === "awaiting_approval") {
+      summary.awaitingApproval += 1;
+      summary.activeRunIds.push(entry.runId);
+    } else if (entry.status === "failed" && entry.finishedAt) {
+      const finishedAt = Date.parse(entry.finishedAt);
+      if (!Number.isNaN(finishedAt) && now - finishedAt <= failedWindowMs) summary.failedRecent += 1;
+    }
+  }
+  summary.activeRunIds.sort();
+  return summary;
+}
+
+export class StudioWorkerError extends Error {
+  constructor(
+    public readonly code: "LLM_MISSING" | "ARCHIVE_REQUIRED" | "PORTRAIT_REUSE_INVALID",
+    message: string,
+  ) {
+    super(message);
+    this.name = "StudioWorkerError";
+  }
+}
+
+/* ================= 门对象映射（§3 审批点矩阵逐字口径） ================= */
+
+function gateObjectOf(gate: GateKey, vendorType: string): { type: string; action: string } {
+  switch (gate) {
+    case "G1_DOSSIER": return { type: "dossier", action: "dossier.confirm" };
+    case "G2_THEME": return { type: "theme", action: "theme.confirm" };
+    case "G3_INSIGHT": return { type: "insight", action: "insight.confirm" };
+    case "G4_PRD": return { type: "prd", action: "prd.confirm" };
+    case "G5_PORTRAIT": return { type: "portrait_set", action: "portrait.confirm" };
+    case "G6_PROMPT": return { type: "prompt_package", action: "prompt.confirm" };
+    case "G7_FINAL": return { type: "project", action: "preproduction.finalize" };
+    default: return { type: vendorType || "gate", action: `${vendorType || "gate"}.confirm` };
+  }
+}
+
+/* ================= 审批轮询 ================= */
+
+interface ApprovalPollRow {
+  status: string;
+  gesture: { reason_enum?: string; reason_text?: string; edited_after?: unknown } | null;
+}
+
+async function readApproval(
+  scope: { tenantId: string; workspaceId: string },
+  approvalId: string,
+): Promise<ApprovalPollRow | null> {
+  const client = await getAppPool().connect();
+  try {
+    // 事务级 RLS 上下文必须在显式事务内设置：autocommit 下 set_config(...,true) 语句结束即失效
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
+    const r = await client.query<ApprovalPollRow>(
+      `SELECT status, gesture FROM approvals WHERE approval_id=$1 AND workspace_id=$2`,
+      [approvalId, scope.workspaceId],
+    );
+    await client.query("COMMIT");
+    return r.rows[0] ?? null;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 轮询审批状态 → GateVerdict（尊重 entry.aborted；超时 fatal='timeout'） */
+async function pollApproval(
+  entry: RunEntry,
+  scope: { tenantId: string; workspaceId: string },
+  approvalId: string,
+): Promise<GateVerdict> {
+  const deadline = Date.now() + APPROVAL_TIMEOUT_MS;
+  for (;;) {
+    if (entry.aborted) return { approved: false, reason: "run-aborted", fatal: "abort" };
+    if (Date.now() >= deadline) {
+      // C-05 修复：超时出口把审批行置 expired——否则审批中心仍显示可办，
+      // 人后来批准了也没有任何消费者（僵尸审批；与 expireSweep 口径一致）
+      try {
+        const client = await getAppPool().connect();
+        try {
+          await client.query("BEGIN");
+          await client.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
+          await client.query(
+            `UPDATE approvals SET status='expired' WHERE approval_id=$1 AND workspace_id=$2 AND status='pending'`,
+            [approvalId, scope.workspaceId],
+          );
+          await client.query("COMMIT");
+        } catch (inner) {
+          // 事务不得带着未决状态归还连接池（否则后续借用者接手一个已中止事务）
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw inner;
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        console.warn(`[studio-worker] 审批超时置 expired 失败（${approvalId}）：`, err instanceof Error ? err.message : err);
+      }
+      return { approved: false, reason: "approval-timeout", fatal: "timeout" };
+    }
+    const row = await readApproval(scope, approvalId);
+    if (row && row.status !== "pending") {
+      if (row.status === "approved") return { approved: true };
+      if (row.status === "edited") {
+        // 编辑后采纳：edited_after 文本作为 suggestions 回传引擎（F5.2 手势语义）
+        const edited = row.gesture?.edited_after;
+        const text = typeof edited === "string" ? edited : edited !== undefined ? JSON.stringify(edited) : "";
+        return { approved: true, suggestions: text ? [text] : [] };
+      }
+      if (row.status === "rejected") {
+        return { approved: false, reason: row.gesture?.reason_text ?? row.gesture?.reason_enum ?? "rejected" };
+      }
+      // expired 等其余终态按驳回处理（L5.4：不存在超时自动放行）
+      return { approved: false, reason: `approval-${row.status}` };
+    }
+    await sleep(APPROVAL_POLL_MS);
+  }
+}
+
+/* ================= 启动入口 ================= */
+
+interface Scope { tenantId: string; workspaceId: string }
+
+/** 定妆照出图配置（缺密钥则显式关闭：保持 vendor 规格包口径，不假装出图） */
+function portraitConfig(selectedCharacters?: BuiltinCharacterResolution): StudioPortraitConfig & {
+  archivedCharacters?: ReturnType<typeof loadPortraitReuseManifest>;
+} {
+  const apiKey = (process.env.VOLCENGINE_ARK_API_KEY ?? process.env.ARK_API_KEY ?? "").trim();
+  const model = (process.env.ARK_IMAGE_MODEL ?? process.env.SEEDREAM_MODEL ?? "").trim();
+  const enabled = (process.env.HR_PORTRAIT_ENABLED ?? "1") !== "0";
+  const reuseManifest = selectedCharacters?.mode === "none" ? undefined : process.env.HR_PORTRAIT_REUSE_MANIFEST?.trim();
+  let archivedCharacters: ReturnType<typeof loadPortraitReuseManifest> | undefined;
+  if (reuseManifest) {
+    try {
+      const supplied = loadPortraitReuseManifest(path.resolve(REPO_ROOT, reuseManifest));
+      const matchesSelected = !selectedCharacters || (selectedCharacters.characters.length === supplied.characters.length
+        && selectedCharacters.characters.every(selected => supplied.characters.some(item => [item.id, item.name, ...(item.aliases ?? [])].some(alias => alias === selected.id || alias === selected.name))));
+      if (matchesSelected) {
+        archivedCharacters = supplied;
+        if (!enabled || !apiKey || !model) throw new Error("复用定妆照要求启用真实运行后端并保留完整模型配置");
+      }
+    } catch (error) {
+      throw new StudioWorkerError("PORTRAIT_REUSE_INVALID", `既有角色复用配置不可核实，拒绝回退生成：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!enabled || !apiKey || !model) {
+    return { enabled: false };
+  }
+  const anchors = (process.env.HR_PORTRAIT_ANCHORS ?? "")
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  return {
+    enabled: true,
+    apiKey,
+    model,
+    baseUrl: process.env.ARK_BASE_URL?.trim(),
+    size: process.env.ARK_IMAGE_SIZE?.trim(),
+    timeoutMs: Number(process.env.HR_PORTRAIT_TIMEOUT_MS ?? 240_000),
+    maxReferenceImages: 4,
+    characterAnchorImages: anchors.map((image) => (path.isAbsolute(image) ? image : path.join(REPO_ROOT, image))),
+    /**
+     * 生产链路 fail-closed：角色定妆照必须带"角色档案"描述。
+     * 真机事故 2026-09-23：描述为空时模型自由发挥，要求"三十岁上下女性"却出了男性模特，
+     * 直接污染真人出镜链路。（vendor 直跑保持默认 false，不影响其它产品。）
+     */
+    requireCharacterDescription: true,
+    ...(archivedCharacters ? { archivedCharacters, archivedCharactersOnly: true } : {}),
+  };
+}
+
+/**
+ * 异步启动一条预生产流水线（不阻塞 tRPC 响应；失败只反映在注册表投影）
+ * @throws StudioWorkerError LLM_MISSING —— LLM_* 四环境变量未配齐（禁止静默降级）
+ */
+type StudioRunInput = RunInput & {
+  /** 原始客户需求；pipelineIntent 可能清理过路由语句并追加了系统口径。 */
+  rawIntent?: string;
+  /** Original caller metadata, before server route/character/platform injection. */
+  customerMetadata?: Record<string, unknown> | null;
+  /** A recovered request must still be the latest immutable contract when the worker claims it. */
+  resumeContract?: CreativeContract;
+  /** 同一入口已经做过选型时复用其受控结果，避免二次选型改写取证依据。 */
+  selectedScenePolicy?: ReturnType<typeof resolveScenePolicyForIntent>;
+  /** 同一入口已经做过平台识别时复用其受控结果。 */
+  selectedPlatform?: ReturnType<typeof resolvePlatformForIntent>;
+  /** 仅服务内建档入口传入；HTTP metadata 中同名字段不参与可信选角。 */
+  selectedBuiltinCharacters?: BuiltinCharacterResolution;
+};
+
+export function startRun(scope: Scope, input: StudioRunInput): string {
+  const customerSource = Object.hasOwn(input, "customerMetadata") ? input.customerMetadata ?? {} : input.metadata ?? {};
+  const sourceMetadata = JSON.parse(JSON.stringify(customerSource)) as Record<string, unknown>;
+  // 补跑/恢复同样经过选型；歧义或知识库损坏在任何供应商调用之前同步失败。
+  const selectedScenePolicy = input.selectedScenePolicy
+    ?? resolveScenePolicyForIntent(input.rawIntent ?? input.intent, input.metadata);
+  /**
+   * 平台识别同样在任何供应商调用之前完成：未识别到平台时按默认口径（抖音）落地，
+   * 并把画幅/语速/钩子窗口口径写进需求正文——此前只在 CLI 传 --platform 时生效。
+   */
+  const selectedPlatform = input.selectedPlatform
+    ?? resolvePlatformForIntent(input.rawIntent ?? input.intent, input.metadata);
+  const selectedBuiltinCharacters = input.selectedBuiltinCharacters ?? resolveBuiltinCharacters(input.rawIntent ?? input.intent, input.metadata);
+  const audienceBound = bindExplicitAudienceMetadata({
+    ...(input.metadata ?? {}),
+    customerOriginalIntent: input.rawIntent ?? input.intent,
+    platform: selectedPlatform.decision.id,
+    scenePolicySelection: selectedScenePolicy.decision,
+    platformSelection: selectedPlatform.decision,
+    ...(selectedScenePolicy.policy ? { scenePolicy: selectedScenePolicy.metadata.scenePolicy } : {}),
+  }, input.rawIntent ?? input.intent);
+  if (audienceBound.changed) console.log(`[studio-worker] 客户明确受众绑定：${audienceBound.audience}`);
+  const resolvedMetadata: Record<string, unknown> = applyBuiltinCharacters(audienceBound.metadata, selectedBuiltinCharacters);
+  const runInput: RunInput = {
+    projectId: input.projectId,
+    intent: appendBuiltinCharacterGuidance(appendPlatformGuidance(appendScenePolicyGuidance(input.intent, selectedScenePolicy.policy), selectedPlatform.decision), selectedBuiltinCharacters),
+    metadata: resolvedMetadata,
+    isMarketing: input.isMarketing,
+  };
+  if ((process.env.ARCHIVE_ENABLED ?? "1") === "0") {
+    throw new StudioWorkerError("ARCHIVE_REQUIRED", "生产预生产必须启用档案与运行租约，拒绝 ARCHIVE_ENABLED=0");
+  }
+  // 在模型、vendor 桥、运行注册表和异步任务之前读取完整复用配置；坏 manifest 不可回退新出图。
+  const portraitOptions = portraitConfig(selectedBuiltinCharacters);
+  const llm = WorkloomLLMEngine.fromEnv();
+  if (!llm) {
+    throw new StudioWorkerError(
+      "LLM_MISSING",
+      "LLM 引擎未配置（需 LLM_BASE_URL/LLM_API_KEY/LLM_MODEL），拒绝启动预生产（vendor 纪律：禁止静默降级）",
+    );
+  }
+  const creativeShotReviewer = createCreativeShotQualityReviewer(llm);
+  // v3.0 收口：注入路由配置——预生产全部 LLM 调用经 routeSmart
+  // （preproduction 场景 × 降级链 × 真实计量 × model.call 事件留痕，fastModel 快速调用强制 L1）
+  const forceModel = resolveVideoModel(process.env) || undefined;
+  llm.attachRouter({
+    providers: poolFromEnv(),
+    sink: new GatewayEventSink(getGatewayPool(), scope, { id: "video-studio" }),
+    policy: modelPolicyFor("ai-video"),
+    scene: "preproduction",
+    allowPeak: process.env.WORKLOOM_ALLOW_PEAK === "1",
+    forceModel,
+  });
+
+  /**
+   * vendor 自建 LLMEngine 也要接到宿主模型路由（2026-09-21 真机修复）：
+   * 剧本引擎/需求洞察等子引擎会自己 new 一个引擎读 vendor 的环境变量与模型名，
+   * 不桥接就会出现「LLM引擎返回失败: API Key 未配置」→ 预生产在 Layer 1 直接失败。
+   */
+  installVendorEngineBridge(llm);
+  // 逐镜渲染的入参归一（空 portraits 数组会以 characterRef.split 崩溃，见 vendor-compat.ts）
+  installVendorRenderCompatBridge();
+  /**
+   * 定妆照绑定桥：把「定妆照集」回填成渲染认得 `characterRef`（真机 2026-09-21：
+   * vendor 只写 portraitBindings，渲染侧读 characterRef，中间断线 → 出了图也报
+   * BINDING_MANIFEST_INVALID）。索引跑完预生产才落盘，故用惰性读取。
+   */
+  const runWorkDir = path.join(WORK_DIR, "workspaces", scope.workspaceId);
+  const portraitIndexPath = path.join(runWorkDir, "characters", input.projectId, "portrait-index.json");
+  const uninstallPortraitBinding = installVendorPortraitBindingBridge({
+    resolveIndex: () => {
+      try {
+        if (!existsSync(portraitIndexPath)) return null;
+        return JSON.parse(readFileSync(portraitIndexPath, "utf8")) as PortraitIndex;
+      } catch {
+        return null;
+      }
+    },
+    maxCharactersPerShot: 1,
+    log: (line) => console.log(line),
+  });
+  /** run 期间的全部 console 输出落盘（逐环节审计证据；run 结束摘除） */
+  const restoreRunLogs = teeRunLogs(input.projectId);
+  console.log(`[studio-worker] run 日志开始落盘：${path.join(WORK_DIR, "logs", `${input.projectId}.log`)}`);
+
+  const entry: RunEntry = {
+    runId: newId("RUN"),
+    projectId: input.projectId,
+    workspaceId: scope.workspaceId,
+    status: "running",
+    currentGate: null,
+    pendingApprovalId: null,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    error: null,
+    resultSummary: null,
+    aborted: false,
+  };
+  runs.set(entry.runId, entry);
+
+  /**
+   * ================= 制片档案（T-2026-0926-0001） =================
+   *
+   * 认领、输入、输出及终结回执是执行前置证据；初始化失败即停止。
+   * 生产入口禁止通过 ARCHIVE_ENABLED=0 关闭档案与运行租约。
+   * 管线类型：营销片（含情报层）/ 叙事片，落进 manifest.pipelineKind 供跨会话承接。
+   */
+  const pipelineKind: PipelineKind = input.isMarketing ? "marketing" : "narrative";
+  const configuredMode = pipelineControlMode();
+  const featureScope = loadPipelineFeatureFlags().scope;
+  const controlMode = featureScope === "all" || featureScope === pipelineKind ? configuredMode : "off";
+  let shadowExpectedPlan: CompiledVideoPipelinePlan | null = null;
+  let shadowObserver: PipelineShadowObserver | null = null;
+  if (controlMode === "shadow") {
+    try {
+      shadowExpectedPlan = loadVideoPipelinePlan(
+        path.join(REPO_ROOT, "bundles", "ai-video", "pipelines", `${pipelineKind}-film.yml`),
+        `${pipelineKind}-film`,
+      );
+      shadowObserver = new PipelineShadowObserver(scope, input.projectId, entry.runId);
+      console.log(`[pipeline-shadow] enabled mode=${controlMode} plan=${shadowExpectedPlan.planHash.slice(0, 12)}`);
+    } catch (error) {
+      console.warn(`[pipeline-shadow] disabled: ${error instanceof Error ? error.message : String(error)}`);
+      shadowExpectedPlan = null;
+      shadowObserver = null;
+    }
+  }
+  const archive = new ArchiveStore(path.resolve(WORK_DIR), scope.workspaceId, input.projectId, pipelineKind, {
+    aspectRatio: runInput.metadata?.aspectRatio ?? null,
+    scenePolicy: selectedScenePolicy.decision,
+  });
+  /** 结构化日志镜像的"当前环节"（StageRunner 在环节边界更新；与文本 tee 并行） */
+  const stageRef: { name: string | null; attempt: number } = { name: null, attempt: 0 };
+  const runner = new StageRunner(archive, makeLedgerWriter(scope), entry.runId, {
+    onStart: (stageId, attempt) => {
+      stageRef.name = stageId;
+      stageRef.attempt = attempt;
+    },
+  });
+  /** 交接包线索（来自真实事件，不猜）：门裁决 + 时长投影 */
+  const decisionLog: string[] = [];
+  const gateProofs = new Map<string, Record<string, unknown>>();
+  const marketingGateEvidence = pipelineKind === "marketing" ? createMarketingGateEvidenceGuard({
+    workDir: runWorkDir,
+    scope: { tenantId: scope.tenantId, workspaceId: scope.workspaceId, projectId: input.projectId, runId: entry.runId },
+  }) : undefined;
+  let completedVendorResult: Awaited<ReturnType<VideoStudio["runPreproduction"]>> | null = null;
+  let creativeSession: Awaited<ReturnType<typeof createCreativeExecutionSession>> | undefined;
+  let creativeSessionFinished = false;
+  let shadowG1: PrdMarketingAuthority | undefined;
+  let currentProductVisual: ReturnType<typeof extractProductVisualAuthority> | undefined;
+
+  const onEvent: EventSink = async (e) => {
+    try {
+      if (e.kind === "pipeline.duration.projected") {
+        const target = (e.payload as { targetSeconds?: unknown } | undefined)?.targetSeconds;
+        const source = (e.payload as { source?: unknown } | undefined)?.source;
+        if (typeof target === "number" && target > 0) {
+          decisionLog.push(`时长：投影目标 ${target}s${typeof source === "string" ? `（source=${source}）` : ""}`);
+        }
+      } else if (e.kind === "pipeline.gate.resolved") {
+        const payload = (e.payload ?? {}) as { approved?: unknown; reason?: unknown };
+        shadowObserver?.observeGate(e.gate);
+        decisionLog.push(
+          `门 ${e.gate ?? "-"}：${payload.approved ? "放行" : "打回"}${payload.reason ? `（${String(payload.reason).slice(0, 120)}）` : ""}`,
+        );
+      }
+      if (decisionLog.length > 20) decisionLog.splice(0, decisionLog.length - 20);
+    } catch (err) {
+      console.error(`[archive] 交接线索采集失败（不影响运行）: ${(err as Error).message}`);
+    }
+    /**
+     * 进度心跳（规格书 §5.2 写盘点②）：预生产单环节跑几十分钟，没有心跳就无法区分
+     * 「慢」与「死」。vendor 的门请求/放行、时长投影就是真实进度信号，直接转成档案心跳
+     * （文件 events.jsonl + PG last_heartbeat_at，PG 侧 5s 节流）。
+     */
+    if (runner && (e.kind === "pipeline.gate.requested" || e.kind === "pipeline.gate.resolved" || e.kind === "pipeline.duration.projected")) {
+      const ctx = runner.currentContext();
+      if (ctx) {
+        void ctx.heartbeat({ event: e.kind, ...(e.gate ? { gate: e.gate } : {}) }).catch((err) => {
+          console.error(`[archive] heartbeat 写入失败: ${(err as Error).message}`);
+        });
+      }
+    }
+    await gatewayAppend(getGatewayPool(), { ...scope, actor: { ...WORKER_ACTOR } }, {
+      who: { ...WORKER_ACTOR },
+      context: {
+        tenant_id: scope.tenantId, workspace_id: scope.workspaceId,
+        time: new Date().toISOString(), channel: "inapp",
+      },
+      object: { type: "video_project", id: e.projectId },
+      decision: {
+        action: e.kind,
+        after: { runId: e.runId ?? entry.runId, gate: e.gate ?? null, ...(e.payload ?? {}) },
+      },
+      rule_impact: [],
+    });
+  };
+
+  const onApproval: ApprovalCallback = async (req) => {
+    // ApprovalCallback.gate 声明为 string，但适配层（studio.ts）保证已 resolveGate 过，运行时为 GateKey
+    const gate = req.gate as GateKey;
+    if (gate === "G1_DOSSIER") shadowObserver?.observeGate(gate);
+    const briefProducts = (runInput.metadata?.brief as { product?: unknown; products?: unknown } | undefined);
+    const noProductPortraits = input.isMarketing
+      ? currentProductVisual?.mode === "abstract_without_product_appearance" || currentProductVisual?.mode === "no_named_product"
+      : !(Array.isArray(runInput.metadata?.products) && runInput.metadata.products.length)
+        && !briefProducts?.product && !(Array.isArray(briefProducts?.products) && briefProducts.products.length);
+    if (gate === "G5_PORTRAIT" && selectedBuiltinCharacters.mode === "none" && !portraitOptions.enabled && noProductPortraits
+      && (!input.isMarketing || gateProofs.get("G1_DOSSIER")?.approved === true)) {
+      gateProofs.set(gate, {
+        gate,
+        approved: true,
+        status: "not_applicable",
+        via: "deterministic",
+        degraded: false,
+        model: null,
+        evidence: [],
+        basis: "no-characters-or-products",
+      });
+      return { approved: true, reason: "no-characters-or-products", suggestions: [] };
+    }
+    const gateObj = gateObjectOf(gate, req.vendorType);
+    const objectId = gate === "G7_FINAL" ? input.projectId : `${input.projectId}:${gate.toLowerCase()}`;
+    const archivePortraitConfig = portraitOptions.enabled && portraitOptions.archivedCharactersOnly ? portraitOptions.archivedCharacters : undefined;
+    if (gate === "G5_PORTRAIT" && archivePortraitConfig) {
+      try {
+        const reuse = acceptPortraitArchiveReuse({ workDir: runWorkDir, projectId: input.projectId,
+          stage: req.archivePortraitStage ?? completedVendorResult?.stages?.portraitStudio,
+          manifest: { path: archivePortraitConfig.manifestPath, sha256: archivePortraitConfig.manifestSha256 } });
+        const previous = gateProofs.get(gate);
+        if (previous?.approved === true) {
+          if (previous.via !== "archive-reuse-acceptance" || !previous.archiveReuse
+            || canonicalRenderJson(previous.archiveReuse) !== canonicalRenderJson(reuse)) {
+            throw new Error("PORTRAIT_REUSE_UNVERIFIED: G7 审核前后本次定妆照复用证据发生变化");
+          }
+          return { approved: true, reason: "archive-reuse-acceptance", suggestions: [] };
+        }
+        const evidence = portraitReuseEvidence(reuse);
+        const proof = { gate, approved: true, status: "passed", via: "archive-reuse-acceptance", degraded: false,
+          model: null, evidence, archiveReuse: reuse };
+        await gatewayAppend(getGatewayPool(), { ...scope, actor: { ...WORKER_ACTOR } }, {
+          who: { ...WORKER_ACTOR }, context: { tenant_id: scope.tenantId, workspace_id: scope.workspaceId,
+            time: new Date().toISOString(), channel: "inapp" },
+          object: { type: gateObj.type, id: objectId }, decision: { action: gateObj.action,
+            after: withGateLedger({ vendorType: req.vendorType, runId: entry.runId, title: req.title, ...proof },
+              buildServerGateRecord({ gate, vendorType: req.vendorType, projectId: input.projectId, runId: entry.runId,
+                approved: true, verdict: { approved: true, via: proof.via, degraded: false,
+                  reason: "本任务明确选择既有合成角色；四角度、来源、选择快照与当前复制图逐字节一致" }, producerMode: PRODUCER_MODE })),
+            basis: ["仅消费本次明确选定既有角色的复用授权，不是新定妆照人工审批、模型图像评审或历史生成证明"] }, rule_impact: [],
+        });
+        gateProofs.set(gate, proof);
+        return { approved: true, reason: "archive-reuse-acceptance", suggestions: [] };
+      } catch (error) {
+        const reason = `portrait-reuse-evidence-failed：${error instanceof Error ? error.message : String(error)}`;
+        gateProofs.set(gate, { gate, approved: false, status: "failed", via: "archive-reuse-acceptance", degraded: false, model: null, evidence: [], reason });
+        return { approved: false, reason, suggestions: [], fatal: "portrait_evidence_missing" };
+      }
+    }
+    let g7PromptArtifact: ProducerArtifact | undefined;
+    const g7Checks: DeterministicCheck[] = [];
+    if (gate === "G7_FINAL" && req.archivePortraitStage) {
+      const portrait = archivePortraitConfig ? await onApproval({ gate: "G5_PORTRAIT", runId: req.runId, vendorType: "portrait-generation",
+        title: "实际定妆照完整性与视觉审核", contentMd: "", archivePortraitStage: req.archivePortraitStage }) : undefined;
+      const reuse = gateProofs.get("G5_PORTRAIT")?.archiveReuse as PortraitArchiveReuseAcceptance | undefined;
+      g7Checks.push({ id: "current-g5-archive-reuse", pass: portrait?.approved === true && Boolean(reuse), hard: true,
+        detail: portrait?.reason ?? "缺少本次实际定妆照复用裁决" });
+      const g6 = gateProofs.get("G6_PROMPT");
+      const g6Path = path.join(runWorkDir, "gates", input.projectId, `attempt-${stageRef.attempt}`, "G6_PROMPT.md");
+      const g6Evidence = (Array.isArray(g6?.evidence) ? g6.evidence : []).filter(item => item?.path === g6Path
+        && item.scope === "complete-text" && typeof item.sha256 === "string" && /^[a-f0-9]{64}$/.test(item.sha256));
+      if (g6?.approved === true && g6.status === "passed" && g6.degraded === false && g6Evidence.length === 1) {
+        const expectedSha256 = g6Evidence[0].sha256 as string;
+        try {
+          if (renderSha256(readFileSync(g6Path)) === expectedSha256) {
+            g7PromptArtifact = { path: g6Path, kind: "text", expectedSha256, note: "本次已通过 G6 的完整镜头提示词报告原件" };
+          }
+        } catch (error) {
+          console.warn("[studio-worker] G7 无法重读本次 G6 报告", error instanceof Error ? error.name : "unknown");
+        }
+      }
+      g7Checks.push({ id: "current-g6-prompt-review", pass: Boolean(g7PromptArtifact), hard: true,
+        detail: g7PromptArtifact ? "本次 G6 已通过且完整报告原件摘要已绑定" : "缺少本次已通过 G6 的完整镜头提示词报告" });
+      if (reuse && portrait?.approved && archivePortraitConfig) {
+        const source = { projectId: input.projectId, runId: entry.runId, attempt: stageRef.attempt,
+          characterId: archivePortraitConfig.characters[0]!.id,
+          version: reuse.selectionReceipt.selectedVersion, manifestSha256: reuse.manifest.sha256, indexSha256: reuse.index.sha256,
+          stage: reuse.stage, outputs: reuse.outputs.map(({ sha256, bytes }, index) => ({
+            angle: ["front", "threeQuarter", "closeup", "side"][index], sha256, bytes,
+          })), g6ReportSha256: g7PromptArtifact?.expectedSha256 };
+        req = { ...req, contentMd: `${req.contentMd}\n\n## 本次服务端核验的 G5 定妆照与 G6 提示词来源\n`
+          + `\`\`\`json\n${JSON.stringify(source)}\n\`\`\`\n` };
+      }
+    }
+    /**
+     * Every video production gate now runs deterministic checks first and then
+     * a versioned system policy. A human approval row or pending_review state is
+     * not created here. The policy is fail-closed when any mandatory control is
+     * missing, stale or blocked.
+     */
+    if (AUTO_GATES.has(gate)) {
+      const producerStage = GATE_PRODUCER_STAGE[gate] ?? "script";
+      let producerVerdict: Awaited<ReturnType<typeof reviewStage>> | null = null;
+      const artifact = writeGateArtifact(runWorkDir, path.join(input.projectId, `attempt-${stageRef.attempt}`), gate, req.contentMd ?? "");
+      const currentArtifact: ProducerArtifact = { path: artifact.path, kind: "text", note: req.title,
+        ...(marketingGateEvidence ? { expectedSha256: renderSha256(req.contentMd ?? "") } : {}) };
+      const portrait = gate === "G5_PORTRAIT" ? portraitGateEvidence({ workDir: runWorkDir, projectId: input.projectId,
+        stage: completedVendorResult?.stages?.portraitStudio,
+        scriptReport: (completedVendorResult?.stages?.scriptEngine as { report?: unknown } | undefined)?.report }) : null;
+      const baseChecks = portrait?.notApplicable
+        ? [{
+            id: "portrait-applicability",
+            status: "not_applicable" as const,
+            pass: false,
+            hard: true,
+            detail: "本次剧本结构 characters_count=0 且 PortraitStudio 无角色/商品任务",
+          }]
+        : [...(portrait?.deterministic ?? gateDeterministicChecks(gate, req.contentMd ?? "")),
+          ...(gate === "G6_PROMPT" && creativeSession ? promptPackageGateChecks(req.contracts) : []), ...g7Checks];
+      const marketingReview = marketingGateEvidence?.forReview(gate, currentArtifact);
+      if (PRODUCER_MODE === "review") {
+        if (portrait?.notApplicable) {
+          producerVerdict = {
+            stage: "keyframe", status: "not_applicable", approved: true, score: 100, hardFailures: [], issues: [], suggestions: [],
+            rerun: false, via: "deterministic", ms: 0, reason: "no-characters-or-products", degraded: false, evidence: [],
+          };
+        } else if (portrait?.deterministic.some((check) => check.hard === true && check.pass === false)) {
+          producerVerdict = {
+            stage: "keyframe",
+            status: "failed",
+            approved: false,
+            score: 0,
+            hardFailures: portrait.deterministic.filter((check) => check.hard === true && check.pass === false).map((check) => check.detail),
+            issues: [],
+            suggestions: [],
+            rerun: false,
+            via: "deterministic",
+            ms: 0,
+            reason: portrait.deterministic.filter((check) => check.hard === true && check.pass === false).map((check) => check.detail).join("；"),
+            degraded: false,
+            evidence: [],
+          };
+        } else {
+          producerVerdict = await reviewStage({
+            stage: producerStage,
+            projectId: input.projectId,
+            artifacts: [currentArtifact, ...(marketingReview?.artifacts ?? []), ...(portrait?.artifacts ?? []), ...(g7PromptArtifact ? [g7PromptArtifact] : [])],
+            deterministic: [...baseChecks, ...(marketingReview?.deterministic ?? [])],
+            ...(marketingReview || g7Checks.length ? { requiredCheckIds: [...(marketingReview?.requiredCheckIds ?? []), ...g7Checks.map(check => check.id)] } : {}),
+            rubric: [
+              ...((GATE_RUBRIC[gate] ?? []) as string[]),
+              ...(marketingReview?.rubric ?? []),
+              ...(g7PromptArtifact ? ["逐镜对照已审核的 G6 完整附件和当前 G7 镜头表，使用本次 G5 四角度逐字节复用回执核对角色身份、版本与适用范围。此门仅审核预生产。"] : []),
+              `门内容全长 ${artifact.chars} 字，已随附件送审；摘录（供定位，不是全文）：${(req.contentMd ?? "").slice(0, 600)}`
+            ],
+            context: { gate, vendorType: req.vendorType, runId: entry.runId, contentChars: (req.contentMd ?? "").length,
+              ...(marketingReview ? { marketingFactsAuthority: marketingReview.context } : {}) },
+            ...(req.contracts ? { contracts: req.contracts } : {}),
+            // 内部准备门默认 fail-closed：评审模型不可用即打回，不静默放行
+            allowFallbackApprove: (process.env.HR_PRODUCER_FALLBACK_APPROVE ?? "0") === "1",
+            log: (line) => console.log(line)
+          });
+          if (marketingReview && marketingGateEvidence) producerVerdict = marketingGateEvidence.verifyReview(marketingReview, producerVerdict);
+        }
+      }
+      const deterministicStatus = (check: DeterministicCheck): AutoApprovalCheck["status"] => {
+        if (check.status === "not_applicable") return "not_applicable";
+        if (check.status === "unverified") return "failed";
+        if (check.pass === false) return "failed";
+        if (PRODUCER_MODE === "review" && producerVerdict) {
+          return producerVerdict.approved ? "passed" : "failed";
+        }
+        return check.pass ? "passed" : "failed";
+      };
+      const deterministicChecks: AutoApprovalCheck[] = [
+        ...baseChecks.filter((check) => check.hard !== false).map((check) => ({
+          id: check.id,
+          category: "deterministic" as const,
+          status: deterministicStatus(check),
+          detail: check.detail,
+          evidenceRef: currentArtifact.path,
+          ...(deterministicStatus(check) === "failed" ? { repairClass: "local_patch" as const } : {}),
+        })),
+        ...(marketingReview?.deterministic ?? []).filter((check) => check.hard !== false).map((check) => ({
+          id: check.id,
+          category: "deterministic" as const,
+          status: deterministicStatus(check),
+          detail: check.detail,
+          evidenceRef: currentArtifact.path,
+          ...(deterministicStatus(check) === "failed" ? { repairClass: "local_patch" as const } : {}),
+        })),
+      ];
+      if (producerVerdict && !producerVerdict.approved && producerVerdict.status !== "not_applicable") {
+        deterministicChecks.push({
+          id: `producer-${producerStage}`,
+          category: "deterministic",
+          status: "failed",
+          detail: producerVerdict.reason,
+          evidenceRef: currentArtifact.path,
+          repairClass: producerVerdict.status === "failed" ? "local_patch" : "no_repair",
+        });
+      }
+      if (deterministicChecks.length === 0) {
+        deterministicChecks.push({
+          id: "gate-content",
+          category: "deterministic",
+          status: "failed",
+          detail: "门没有可核验的确定性证据",
+          evidenceRef: currentArtifact.path,
+          repairClass: "no_repair",
+        });
+      }
+      const contentHash = renderSha256(req.contentMd ?? "");
+      const auto = evaluateVideoSystemAutoApproval(systemAutoApprovalEnabled(), {
+        gateKey: gate,
+        action: gateObj.action,
+        artifactSha256: contentHash,
+        factHash: contentHash,
+        expectedFactHash: contentHash,
+        deterministicChecks,
+        budget: {
+          status: "not_applicable",
+          detail: "this preproduction gate does not dispatch a paid provider request",
+          evidenceRef: `gate:${gate}:budget`,
+        },
+        qualification: {
+          status: "passed",
+          detail: "the current gate artifact is the exact bytes evaluated by the policy",
+          evidenceRef: `sha256:${contentHash}`,
+        },
+        permission: {
+          status: "passed",
+          detail: "current tenant/workspace worker scope is authorized for the video gate",
+          evidenceRef: `${scope.tenantId}/${scope.workspaceId}`,
+        },
+        fence: {
+          status: "passed",
+          level: "review",
+          detail: "the review-level video gate is convertible only after every mandatory check passes",
+          evidenceRef: `fence:${gate}:${VIDEO_SYSTEM_AUTO_APPROVAL_POLICY.version}`,
+          triggeredBy: [gate],
+        },
+        evidenceRefs: [{
+          id: `gate:${gate}`,
+          kind: "file",
+          sha256: contentHash,
+          ref: path.relative(runWorkDir, currentArtifact.path),
+        }],
+      });
+      const approved = auto.outcome === "passed";
+      /**
+       * 门外账本字段（2026-09-25）：把平台门按 **step_key** 记账，与 CLI 运行时同一套口径。
+       * 能一一对应的门（G5/G6/G7）在事件 payload 里带 `stepKey` 与规范化 `gateEvent`；
+       * 未知/未映射门返回 null，payload 保持原样（**不猜映射**，审计一眼能看出"这个门没有 step_key"）。
+       */
+      const gateRecord = buildServerGateRecord({
+        gate,
+        vendorType: String(req.vendorType ?? ""),
+        projectId: input.projectId,
+        runId: entry.runId,
+        approved,
+        verdict: producerVerdict,
+        producerMode: PRODUCER_MODE
+      });
+      const autoClient = await getAppPool().connect();
+      try {
+        await autoClient.query("BEGIN");
+        await autoClient.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
+        await autoClient.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
+        await gatewayAppendOnClient(autoClient, { ...scope, actor: { id: "system", type: "system" } }, {
+          who: { id: "system", type: "system" },
+          context: {
+            tenant_id: scope.tenantId, workspace_id: scope.workspaceId,
+            time: new Date().toISOString(), channel: "inapp",
+          },
+          object: { type: gateObj.type, id: objectId },
+          decision: {
+            action: "system-auto-approval",
+            after: withGateLedger({
+              gate: req.gate, vendorType: req.vendorType, runId: entry.runId, title: req.title,
+              approved,
+              outcome: auto.outcome,
+              policyId: auto.receipt.policyId,
+              policyVersion: auto.receipt.policyVersion,
+              evidenceDigest: auto.receipt.evidenceDigest,
+              checks: auto.checks,
+              ...(producerVerdict
+                ? {
+                    score: producerVerdict.score, via: producerVerdict.via, model: producerVerdict.model ?? null,
+                    degraded: producerVerdict.degraded, issues: producerVerdict.issues,
+                    suggestions: producerVerdict.suggestions, reason: producerVerdict.reason,
+                    ...(approved ? { advisories: producerVerdict.suggestions } : {}),
+                  }
+                : {}),
+            }, gateRecord),
+            basis: [
+              `${auto.receipt.policyId}@${auto.receipt.policyVersion}: `
+              + `deterministic/fact/budget/qualification/permission/fence -> ${auto.outcome}`,
+            ],
+          },
+          rule_impact: auto.checks.map((check) => ({
+            rule_id: check.id,
+            version: auto.receipt.policyVersion,
+            result: check.status === "passed" ? "pass" : check.status === "failed" ? "blocked" : "review",
+          })),
+        });
+        await autoClient.query("COMMIT");
+      } catch (err) {
+        await autoClient.query("ROLLBACK").catch(() => undefined);
+        throw err;
+      } finally {
+        autoClient.release();
+      }
+      gateProofs.set(gate, { ...(producerVerdict ?? {}),
+        gate, approved, status: approved
+          ? producerVerdict?.status === "not_applicable" ? "not_applicable" : "passed"
+          : auto.outcome === "blocked" ? "blocked" : "failed",
+        via: producerVerdict?.via ?? "deterministic", degraded: producerVerdict?.degraded ?? false,
+        model: producerVerdict?.model ?? null, evidence: producerVerdict?.evidence ?? [],
+        autoApproval: auto.receipt,
+        ...(approved && producerVerdict?.suggestions.length ? { advisories: producerVerdict.suggestions } : {}),
+        ...(producerVerdict?.status === "not_applicable" ? { basis: producerVerdict.reason } : {}) });
+      return {
+        approved,
+        reason: `${auto.outcome}(${req.gate} · ${auto.receipt.policyId}@${auto.receipt.policyVersion})：`
+          + auto.blockingChecks.map((check) => check.detail).join("；"),
+        suggestions: approved ? [] : (producerVerdict?.suggestions ?? []),
+        ...(approved && producerVerdict?.suggestions.length ? { advisories: producerVerdict.suggestions } : {}),
+        fatal: approved ? undefined : auto.outcome === "repair" ? "system_auto_repair" : "system_auto_blocked",
+      };
+    }
+    gateProofs.set(gate, {
+      gate,
+      approved: false,
+      status: "blocked",
+      via: "system-auto-approval",
+      degraded: false,
+      model: null,
+      evidence: [],
+      basis: `${gate} is not covered by the active video auto-approval policy`,
+    });
+    return { approved: false, reason: `system-auto-policy-missing(${gate})`, suggestions: [], fatal: "system_auto_blocked" };
+  };
+
+  let marketingDossierRoot: string | undefined;
+  let marketingDossierRef: string | undefined;
+  const studioConfig: StudioConfig = {
+    llm,
+    workDir: runWorkDir,
+    onApproval,
+    onEvent,
+    totalDeadlineMs: TOTAL_DEADLINE_MS,
+    // 片型硬闸必须在 G8 之前审完整分镜，禁止 env 让 vendor 在审计前直接渲染。
+    deferRender: selectedScenePolicy.policy ? true : (process.env.HR_DEFER_RENDER ?? "1") !== "0",
+    portraits: portraitOptions,
+    /** 营销路由 → 情报五站真跑（叙事路由不装配，vendor 也不会进情报层） */
+    dataMining: input.isMarketing ? undefined : dataMiningConfigFor(runInput.metadata, llm, scope.workspaceId),
+    log: (line) => console.log(line),
+  };
+
+  // 异步执行：不阻塞 tRPC 响应；终态只写注册表投影（生命周期事件由 onEvent 落库）
+  void (async () => {
+    /**
+     * 项目级执行者租约（规格书 §11：同一项目同一时刻只允许一个执行者，杜绝双写与重复烧额度）。
+     * 会话级 advisory lock 持有到 run 结束；进程被 kill -9 → 连接断开 → 锁自动释放。
+     */
+    let activeLease: Awaited<ReturnType<typeof acquireProjectLease>> = null;
+    let detachStructuredLog: (() => void) | null = null;
+    let projectMeta: Awaited<ReturnType<typeof readProjectMeta>> = null;
+    try {
+      if (controlMode === "enforce") assertCreativeConfigurationReady(process.env, llm.model);
+      activeLease = await acquireProjectLease(scope, input.projectId);
+      if (!activeLease) {
+        throw new Error(`项目 ${input.projectId} 已有执行者持有档案租约（不重复启动，避免双份烧额度）`);
+      }
+      await assertNoCreativePendingUsage({ ...scope, projectId: input.projectId }, { rejectActiveEnforce: controlMode !== "enforce" });
+      projectMeta = await readProjectMeta(scope, input.projectId);
+      if (!projectMeta) throw new Error(`PROJECT_NOT_FOUND: 项目 ${input.projectId} 不存在或不属于当前工作区`);
+      if (projectMeta.kind !== pipelineKind) throw new Error("PIPELINE_KIND_MISMATCH：预生产管线与服务项目类型不一致");
+      if (portraitOptions.enabled) portraitOptions.trustedProductReferences = await resolveStudioProductReferences({
+        app: getAppPool(), scope, projectId: input.projectId, metadata: sourceMetadata, repositoryRoot: REPO_ROOT,
+      });
+      if (input.resumeContract && controlMode !== "enforce") {
+        throw new Error("CREATIVE_MODE_CHANGED: 原创作合同仅能在 enforce 模式恢复");
+      }
+      if (controlMode === "enforce") {
+        creativeSession = await createCreativeExecutionSession({ scope, projectId: input.projectId,
+          runId: entry.runId, rawIntent: input.rawIntent ?? input.intent, metadata: sourceMetadata,
+          isMarketing: Boolean(input.isMarketing), mode: "enforce", model: llm.model,
+          expectedContract: input.resumeContract, shouldAbort: () => entry.aborted });
+        await creativeSession.beginStage("preparation");
+      }
+      await archive.ensure({ kind: projectMeta.kind, title: projectMeta.title, createdAt: projectMeta.createdAt });
+      // 既有项目补跑可能改用新的明确片型；manifest 保存当前决策，旧值留在追加事件中。
+      const manifest = await archive.readManifest();
+      if (!manifest) throw new Error(`项目 ${input.projectId} 制片档案 manifest 缺失`);
+      if (JSON.stringify(manifest.routeMeta?.scenePolicy ?? null) !== JSON.stringify(selectedScenePolicy.decision)) {
+        const previous = manifest.routeMeta?.scenePolicy ?? null;
+        await archive.writeJsonAtomic("manifest.json", {
+          ...manifest,
+          routeMeta: { ...(manifest.routeMeta ?? {}), scenePolicy: selectedScenePolicy.decision },
+          updatedAt: new Date().toISOString(),
+        });
+        await archive.appendJsonl("events.jsonl", {
+          kind: "scene-policy.route-changed", runId: entry.runId,
+          previous, current: selectedScenePolicy.decision,
+        });
+      }
+      detachStructuredLog = attachStructuredLog(archive, {
+        currentStage: () => stageRef.name,
+        currentAttempt: () => stageRef.attempt,
+      });
+      await archive.appendJsonl("events.jsonl", {
+        kind: "run.started", runId: entry.runId, pipelineKind,
+        threadId: projectMeta.threadId, intent: input.intent.slice(0, 200),
+        scenePolicy: selectedScenePolicy.decision,
+      });
+      await gatewayAppend(getGatewayPool(), { ...scope, actor: { ...WORKER_ACTOR } }, {
+        who: { ...WORKER_ACTOR },
+        context: {
+          tenant_id: scope.tenantId, workspace_id: scope.workspaceId,
+          time: new Date().toISOString(), channel: "inapp",
+        },
+        object: { type: "video_project", id: input.projectId },
+        decision: {
+          action: "video.scene_policy.selected",
+          after: { runId: entry.runId, ...selectedScenePolicy.decision },
+          basis: ["原始需求与已安装片型知识条目在生成前确定性匹配；未命中仍留空选择证据"],
+        },
+        rule_impact: [],
+      });
+      /**
+       * AI 监制打回 → **默认打回即停，不再自动重跑**（T-2026-1001-0007）。
+       *
+       * 为什么改：自动重跑会把"AI 认为不合适"直接变成"再花钱重出一遍"，
+       * 真机上正是"打回 → 自动重跑（含重新出图）→ 再打回"的烧钱循环。
+       * 现在 AI 监制只负责**把问题提前暴露**；打回即停并如实上报，是否重做由人决定。
+       * 显式设 `VM_PRODUCER_RETRY=1`（或更大）才恢复旧的有上限自动重跑口径。
+       *
+       * 制片档案口径（T-2026-0926-0001）：每次重跑 = 新 attempt（`claimRun` 原子递增），
+       * 「第几次尝试、耗时、错误分类」全部落盘，历史不丢。
+       */
+      const maxAttempts = creativeSession ? 1 : Math.max(1, Number(process.env.VM_PRODUCER_RETRY ?? 0) + 1);
+      let finalCreativeRenderBinding: { attempt: number; promptsSha256: string } | undefined;
+      const runOnce = async (): Promise<Awaited<ReturnType<VideoStudio["runPreproduction"]>>> => {
+        const runnerStore = archive;
+        // 档案 output 是给索引/交接包使用的摘要，不能取代 vendor 业务结果。
+        // confirmations 决定打回重试，stages.dataMining 决定商品档案投影；两者必须完整保留。
+        let rawResult: Awaited<ReturnType<VideoStudio["runPreproduction"]>> | undefined;
+        await runner.run(
+          "preproduction",
+          { intent: runInput.intent, isMarketing: input.isMarketing ?? false, pipelineKind, scenePolicy: selectedScenePolicy.decision },
+          async (ctx) => {
+            gateProofs.clear();
+            marketingGateEvidence?.reset(ctx.attempt);
+            completedVendorResult = null;
+            shadowG1 = undefined;
+            /**
+             * 断点快照（真机发现的方案缺陷修复，T-2026-0926-0001 留痕）：
+             * vendor 在 Phase checkpoint 指纹不匹配时会**删除**自己的 checkpoint
+             * （production-engine.js#_loadLatestCheckpoint），"曾经有断点但恢复没命中"这段证据
+             * 会被重跑就地销毁。开跑前先只读快照进档案，供恢复对账与工程发现。
+             */
+            const preCheckpoints = await runnerStore
+              .snapshotExternalDir(
+                path.resolve(runWorkDir, "checkpoints", input.projectId),
+                `checkpoints/attempt-${ctx.attempt}-before`,
+                { filter: (name) => name.endsWith(".json") },
+              )
+              .catch((err) => {
+                console.error(`[archive] 断点快照失败（继续执行）: ${(err as Error).message}`);
+                return { files: 0, bytes: 0, skipped: [] as string[] };
+              });
+            let marketing: PreparedMarketingFacts | undefined;
+            let productReferences: ProductionProductReference[] = [];
+            let g1Approved = true;
+            const selectedManifest = input.isMarketing && portraitOptions.enabled ? portraitOptions.archivedCharacters : undefined;
+            const productInput = selectedManifest?.productReferenceSelection === undefined ? undefined : {
+              app: getAppPool(), scope, projectId: input.projectId, manifest: selectedManifest,
+              rawIntentSha256: renderSha256(input.rawIntent ?? input.intent),
+            };
+            const selectedImageSources = productInput ? await resolveProductionProductReferences(productInput) : undefined;
+            if (input.isMarketing) {
+              marketing = await prepareMarketingFacts({ scope: { ...scope, projectId: input.projectId, runId: entry.runId, attempt: ctx.attempt },
+                root: archive.root, metadata: sourceMetadata, intent: input.rawIntent ?? input.intent, llm,
+                searchCacheFile: path.join(WORK_DIR, "search-cache", `${scope.workspaceId}.json`), selectedImageSources });
+              const verdict = await onApproval({ runId: entry.runId, gate: "G1_DOSSIER", vendorType: "host-source-dossier",
+                title: "本次营销来源正文与逐主张事实审核", contentMd: marketing.g1Content });
+              const proof = gateProofs.get("G1_DOSSIER");
+              const systemAutoPassed = proof?.status === "passed"
+                && (proof.autoApproval as { outcome?: unknown; policyVersion?: unknown } | undefined)?.outcome === "passed"
+                && typeof (proof.autoApproval as { policyVersion?: unknown } | undefined)?.policyVersion === "string";
+              g1Approved = verdict.approved === true && proof?.status === "passed" && proof?.degraded === false
+                && (systemAutoPassed || (proof?.via === "llm" && typeof proof.model === "string" && proof.model.length > 0))
+                && Array.isArray(proof.evidence) && proof.evidence.some(item => item?.scope === "complete-text" && item?.sha256 === renderSha256(marketing!.g1Content));
+              if (g1Approved) {
+                marketingGateEvidence?.acceptG1({ scope: marketing.bundle.scope, content: marketing.g1Content, proof });
+                currentProductVisual = extractProductVisualAuthority(marketing.g1Content);
+                if (productInput && selectedImageSources?.length) {
+                  productReferences = await resolveProductionProductReferences({ ...productInput, productVisualAuthority: currentProductVisual });
+                }
+              }
+              marketingDossierRoot = marketing.storeRoot;
+              marketingDossierRef = path.posix.join("archive", scope.workspaceId, input.projectId, `${marketing.prefix}-dossier`);
+            }
+            const verifiedRawJson = marketing ? canonicalRenderJson(toJennyMarketingRaw(marketing.raw, marketing.bundle)) : undefined;
+            const currentG1 = marketing && g1Approved ? marketingGateEvidence!.forPrd() : undefined;
+            if (controlMode === "shadow") shadowG1 = currentG1;
+            const activeCreative = creativeSession;
+            const studio = g1Approved ? new VideoStudio({ ...studioConfig,
+              ...(portraitOptions.enabled && productReferences.length ? { portraits: { ...portraitOptions,
+                archivedProductReferences: productReferences.map(({ productId, productName }) => ({ productId, productName })) } } : {}),
+              ...(activeCreative ? { creativeExecution: { mode: "enforce" as const, rawIntent: input.rawIntent ?? input.intent,
+                sourceMetadata, session: activeCreative, reviewShot: creativeShotReviewer,
+                selectCandidate: async ({ contract, visualAuthority, creativeInput, assertCurrent }) => {
+                  const endpoint = videoTextEndpointFromEnv();
+                  if (!endpoint || endpoint.model !== llm.model) throw new Error("CREATIVE_BUDGET_UNCONFIGURED: candidate model must match the current Studio model");
+                  return runEarlyCreativeCandidates({ session: activeCreative, endpoint, runId: entry.runId, count: 2, creativeInput,
+                    ...(visualAuthority ? { visual: visualAuthority } : {}),
+                    // Only a selection matched to this project or intent can require a G1-bound receipt.
+                    ...(selectedImageSources?.length ? { trustedProductReferences: productReferences } : {}),
+                    assertCurrent: async () => { await assertCurrent(); await verifyCreativeMarketingSource(contract); } });
+                } } } : {}), ...(marketing ? { dataMining: {
+              mode: "api", storeRoot: marketing.storeRoot, refresh: true,
+              verifiedRaw: { projectId: input.projectId, rawJson: verifiedRawJson!, sha256: renderSha256(verifiedRawJson!), productQuery: marketing.bundle.productQuery,
+                prdAuthority: currentG1 },
+            } } : {}) }) : undefined;
+            /**
+             * 传入 runInput（而不是 input）：它带上了本轮的片型选型结论与注入指引，
+             * vendor 的提示词/分镜必须按本次选中的知识条目生成；G1 营销事实仍取自原始 input。
+             */
+            const r: Awaited<ReturnType<VideoStudio["runPreproduction"]>> = studio ? await studio.runPreproduction(runInput) : {
+              success: false, stages: {}, confirmations: { hostG1: { approved: false, reason: "producer-rejected(G1_DOSSIER)：本次来源与事实未通过真实监制" } },
+            };
+            completedVendorResult = r;
+            if (r.success) {
+              // vendor 真出图批量模式跳过的是生成前询问；服务必须在实际图片存在后完成 G5。
+              const portraitVerdict = await onApproval({ runId: entry.runId, gate: "G5_PORTRAIT", vendorType: "portrait-generation",
+                title: "实际定妆照完整性与视觉审核", contentMd: JSON.stringify({ portraitStudio: r.stages?.portraitStudio,
+                  scriptReport: (r.stages?.scriptEngine as { report?: unknown } | undefined)?.report }) });
+              r.confirmations = { ...((r.confirmations ?? {}) as Record<string, unknown>), hostPortraits: portraitVerdict };
+              if (!portraitVerdict.approved) r.success = false;
+            }
+            if (r.success) {
+              const missing = [...(input.isMarketing ? ["G1_DOSSIER"] : []), "G2_THEME", "G3_INSIGHT", "G4_PRD", "G5_PORTRAIT", "G6_PROMPT", "G7_FINAL"].filter(gate => {
+                const proof = gateProofs.get(gate);
+                const auto = proof?.autoApproval as { outcome?: unknown; policyVersion?: unknown } | undefined;
+                return !(proof?.approved === true && (proof.status === "passed" && ((proof.via === "llm" && proof.degraded === false)
+                  || (auto?.outcome === "passed" && typeof auto.policyVersion === "string")
+                  || (gate === "G5_PORTRAIT" && proof.via === "owner-acceptance" && proof.degraded === false))
+                  || (gate === "G5_PORTRAIT" && proof.status === "passed" && proof.via === "archive-reuse-acceptance" && proof.degraded === false && proof.archiveReuse)
+                  || gate === "G5_PORTRAIT" && proof.status === "not_applicable" && proof.basis === "no-characters-or-products"));
+              });
+              if (missing.length) {
+                r.success = false;
+                r.confirmations = { ...((r.confirmations ?? {}) as Record<string, unknown>), hostQualification: { approved: false,
+                  reason: `producer-rejected：缺少服务监制裁决 ${missing.join(",")}`, fatal: "producer_rejected" } };
+              }
+            }
+            rawResult = r;
+            await ctx.heartbeat({ stages: Object.keys(r.stages ?? {}) });
+            const vendorResumed = (r as unknown as { resumed?: unknown }).resumed === true;
+            const vendorDegraded = (r as unknown as { degraded?: unknown }).degraded === true;
+            if (preCheckpoints.files > 0) {
+              await ctx.log(
+                "info",
+                `断点快照 ${preCheckpoints.files} 个文件 / ${preCheckpoints.bytes}B；本轮 vendor resumed=${vendorResumed}`,
+                { files: preCheckpoints.files, resumed: vendorResumed, attempt: ctx.attempt },
+              );
+              decisionLog.push(
+                `第 ${ctx.attempt} 次尝试：开跑前存在 ${preCheckpoints.files} 个 Phase checkpoint，本轮 resumed=${vendorResumed}`,
+              );
+            }
+            /**
+             * 环节自评（诚实台账）：vendor 跑完但 `success:false`（含 AI 监制打回）时，
+             * 台账必须记 failed + 错误分类，否则监控器把真实失败聚类成 BUG 或完全看不见。
+             */
+            const rejected = isProducerRejection(r);
+            /**
+             * 失败原因取 vendor 的 `result.errors[]`（真实证据：哪个环节、什么错）。
+             * 只写 `success:false` 会让监控把所有业务失败都聚类成 BUG（P0 误升级）。
+             */
+            const rawErrors = (r as unknown as { errors?: unknown }).errors;
+            const vendorErrors = Array.isArray(rawErrors)
+              ? (rawErrors as Array<Record<string, unknown>>).slice(0, 10)
+              : [];
+            // Include the original rejected confirmation when no result.errors[] was emitted.
+            const failureMessage = terminalFailureMessageOf(r);
+            const outcome = r.success
+              ? undefined
+              : {
+                  status: "failed" as const,
+                  errorClass: rejected ? "GATE_REJECTED" : classifyError(new Error(failureMessage)),
+                  errorMsg: failureMessage,
+                };
+            /**
+             * 营销片：收编情报档案指针（dossier 在档案夹之外，跨会话承接不断链）；
+             * 字段口径对齐既有 resultSummary 摘要（studio-worker.ts resultSummary）。
+             */
+            const dm = (r.stages?.dataMining ?? null) as
+              | { status?: string; product_id?: string; data?: { dossier?: { provenance?: unknown[] } } }
+              | null;
+            /**
+             * 提示词包落档案（真机审计发现 D3）：预生产最有价值的产物是 6 镜 × 25/30 字段的完整提示词，
+             * 但 vendor 只把它们留在内存与 console（`checkpointDir` 指向的 Phase checkpoint 在成功后
+             * 会被 vendor 主动清理）。档案号称"自包含、可跨会话承接"，就必须把提示词本体落盘，
+             * 否则新会话拿到档案也接不上下一步（提交渲染/交付）。
+             */
+            // A rejected vendor result has no formal handoff. Preserve its real gate/error outcome.
+            const shots = r.success === true ? completePreproductionShots(r) : [];
+            const promptPack = shots.length
+              ? {
+                  stageId: "preproduction",
+                  attempt: ctx.attempt,
+                  pipelineKind,
+                  scenePolicy: selectedScenePolicy.decision,
+                  generatedAt: new Date().toISOString(),
+                  shotCount: shots.length,
+                  totalPromptChars: shots.reduce((sum, shot) => sum + String(shot.prompt ?? "").length, 0),
+                  dossier: dm
+                    ? { root: marketingDossierRef ?? `dossiers/${scope.workspaceId}`, productId: dm.product_id ?? null }
+                    : null,
+                  shots: shots.map((shot) => ({
+                    shotId: shot.shot_id ?? shot.shotId ?? null,
+                    sceneId: shot.scene_id ?? shot.sceneId ?? null,
+                    sceneType: shot.scene_type ?? shot.sceneType ?? null,
+                    durationSec: shot.duration ?? null,
+                    degraded: shot.degraded === true,
+                    promptCharCount: String(shot.prompt ?? "").length,
+                    /** 提示词包内的字段序号与名称（`01.【语言约束】…` 口径），供审计核对"25/30 字段是否齐" */
+                    promptFieldNames: Array.from(
+                      String(shot.prompt ?? "").matchAll(/\d{1,2}\.【([^】]{1,10})】/g),
+                    ).map((m) => m[1]),
+                    fieldKeys: shot.fields && typeof shot.fields === "object" ? Object.keys(shot.fields as object) : [],
+                    prompt: String(shot.prompt ?? ""),
+                    fields: shot.fields ?? null,
+                  })),
+                }
+              : null;
+            // The immutable original cards are shared by policy and ordinary CLI handoff.
+            // draft:true never grants render approval; existing G1-G7 and CLI guards still apply.
+            const source = { kind: "system-preproduction", issuer: "workloom.studio-worker", resultPath: "result.shots",
+              tenantId: scope.tenantId, workspaceId: scope.workspaceId, projectId: input.projectId, runId: entry.runId, attempt: ctx.attempt };
+            const primary = selectedBuiltinCharacters.characters[0];
+            const nativeCharacter = r.character && typeof r.character === "object" && !Array.isArray(r.character)
+              ? r.character as Record<string, unknown> : null;
+            if (shots.length && nativeCharacter && (!primary || nativeCharacter.id !== primary.id
+              || (nativeCharacter.name !== undefined && nativeCharacter.name !== primary.name))) {
+              throw new Error("PREPRODUCTION_HANDOFF_INVALID: 原生项目人物与本次宿主选角不一致");
+            }
+            const brief = runInput.metadata?.brief as Record<string, unknown> | undefined;
+            const production = brief?.productionRequirements as Record<string, unknown> | undefined;
+            const aspect = creativeSession?.contract.profile?.aspectRatio ?? brief?.aspectRatio ?? brief?.aspect_ratio;
+            const resolution = creativeSession?.contract.profile?.resolution ?? production?.resolution;
+            const shotlistArtifact = shots.length
+              ? await ctx.writeArtifact(`stages/preproduction/attempt-${ctx.attempt}.shotlist.json`, {
+                  schemaVersion: "workloom.preproduction-cli-handoff/v1",
+                  projectId: input.projectId,
+                  title: projectMeta?.title ?? input.rawIntent ?? input.intent,
+                  durationSeconds: shots.reduce((sum, shot) => sum + Number(shot.duration), 0),
+                  ...(typeof aspect === "string" ? { aspect } : {}),
+                  ...(typeof resolution === "string" ? { resolution } : {}),
+                  source,
+                  metadata: { ...structuredClone(runInput.metadata ?? {}),
+                    ...(runInput.metadata?.source !== undefined ? { inputSource: structuredClone(runInput.metadata.source) } : {}), source },
+                  characters: structuredClone(selectedBuiltinCharacters.characters),
+                  ...(primary ? { character: { ...structuredClone(primary), ...structuredClone(nativeCharacter ?? {}),
+                    source: { kind: "host-selected-character", selection: structuredClone(selectedBuiltinCharacters.decision),
+                      ...(nativeCharacter?.source !== undefined ? { nativeSource: structuredClone(nativeCharacter.source) } : {}) } } } : {}),
+                  // Keep upstream G3/G4 cast and scene provenance as authored, without reconstructing it.
+                  preproduction: { stages: structuredClone(r.stages ?? {}), confirmations: structuredClone(r.confirmations ?? {}) },
+                  ...(selectedScenePolicy.policy ? { scenePolicy: {
+                    id: selectedScenePolicy.policy.id,
+                    version: selectedScenePolicy.policy.version,
+                    sourceSha256: selectedScenePolicy.policy.sourceSha256 ?? null,
+                    exceptions: (selectedScenePolicy.metadata.scenePolicy as { exceptions?: ScenePolicyException[] } | undefined)?.exceptions ?? [],
+                  } } : {}),
+                  scenePolicySelection: selectedScenePolicy.decision,
+                  draft: true,
+                  shots,
+                })
+              : null;
+            const promptsArtifact = promptPack
+              ? await ctx.writeArtifact(`stages/preproduction/attempt-${ctx.attempt}.prompts.json`, promptPack)
+              : null;
+            const scenePolicyReport = r.success === true && selectedScenePolicy.policy
+              ? auditScenePolicy({
+                  title: input.rawIntent ?? input.intent,
+                  scenePolicy: {
+                    id: selectedScenePolicy.policy.id,
+                    exceptions: ((selectedScenePolicy.metadata.scenePolicy as { exceptions?: ScenePolicyException[] } | undefined)?.exceptions ?? []),
+                  },
+                  shots: shots.map((shot): ScenePolicyShot => ({
+                    ...shot,
+                    shotId: typeof (shot.shotId ?? shot.shot_id) === "string" ? String(shot.shotId ?? shot.shot_id) : "",
+                    duration: Number(shot.duration ?? 0),
+                  })),
+                }, selectedScenePolicy.policy)
+              : null;
+            if (scenePolicyReport) scenePolicyReport.policy.selection = selectedScenePolicy.decision.reason;
+            const scenePolicyReportRef = `stages/preproduction/attempt-${ctx.attempt}.scene-policy-report.json`;
+            const scenePolicyReportArtifact = scenePolicyReport
+              ? await ctx.writeArtifact(scenePolicyReportRef, scenePolicyReport)
+              : null;
+            if (scenePolicyReport && (!scenePolicyReportArtifact || scenePolicyReportArtifact.truncated)) {
+              throw new Error("片型硬闸：分镜审计报告未完整归档，拒绝继续渲染接续");
+            }
+            if (scenePolicyReport) {
+              await gatewayAppend(getGatewayPool(), { ...scope, actor: { ...WORKER_ACTOR } }, {
+                who: { ...WORKER_ACTOR },
+                context: {
+                  tenant_id: scope.tenantId, workspace_id: scope.workspaceId,
+                  time: new Date().toISOString(), channel: "inapp",
+                },
+                object: { type: "video_project", id: input.projectId },
+                decision: {
+                  action: "video.scene_policy.audited",
+                  after: {
+                    runId: entry.runId, attempt: ctx.attempt,
+                    policyId: selectedScenePolicy.policy!.id,
+                    passed: scenePolicyReport.passed,
+                    defects: scenePolicyReport.defects.slice(0, 30),
+                    reportRef: scenePolicyReportRef,
+                    reportSha256: scenePolicyReportArtifact!.sha256,
+                  },
+                  basis: ["完整镜头表按时长配比和逐镜证据执行片型硬闸；报告先落档案再裁决"],
+                },
+                rule_impact: [],
+              });
+              if (!scenePolicyReport.passed && r.success) {
+                const first = scenePolicyReport.defects.slice(0, 5)
+                  .map((item) => `${item.shotId ?? "全片"}[${item.rule}] ${item.detail}`).join("；");
+                throw new Error(`片型硬闸打回（${scenePolicyReport.defects.length} 项）：${first}；详见 ${scenePolicyReportRef}`);
+              }
+            }
+            if (r.success === true && (!shotlistArtifact || shotlistArtifact.truncated || !promptsArtifact || promptsArtifact.truncated)) {
+              throw new Error("PREPRODUCTION_HANDOFF_INCOMPLETE: 完整分镜草稿或提示词包未完整归档，拒绝继续渲染接续");
+            }
+            if (promptsArtifact) {
+              decisionLog.push(
+                `提示词包已归档：${promptPack!.shotCount} 镜 / ${promptPack!.totalPromptChars} 字符`
+                + `（stages/preproduction/attempt-${ctx.attempt}.prompts.json，sha256=${promptsArtifact.sha256.slice(0, 12)}）`,
+              );
+            }
+            const marketingFacts = marketing && r.success && promptPack ? await finalizeMarketingFacts(marketing,
+              promptPack.shots.map(shot => ({ shotId: String(shot.shotId ?? ""), prompt: shot.prompt, fields: shot.fields }))) : undefined;
+            if (marketing && r.success && !marketingFacts) throw new Error("MARKETING_PROMPTS_UNVERIFIED：营销预生产没有完整最终镜头事实审核");
+            if (creativeSession && r.success && promptsArtifact && !promptsArtifact.truncated) {
+              finalCreativeRenderBinding = { attempt: ctx.attempt, promptsSha256: promptsArtifact.sha256 };
+            }
+            return {
+              output: {
+                success: r.success,
+                ...(marketingFacts ? { marketingFactsRef: marketingFacts.ref, marketingFactsSha256: marketingFacts.sha256 } : {}),
+                productionEvidence: { schemaVersion: "workloom.preproduction-authority/v1", issuer: "workloom.studio-worker",
+                  tenantId: scope.tenantId, workspaceId: scope.workspaceId, projectId: input.projectId,
+                  runId: entry.runId, attempt: ctx.attempt, pipelineKind, gates: [...gateProofs.values()],
+                  ...(r.success && productReferences.length ? { productReferences } : {}),
+                  ...(creativeSession ? { creativeExecution: { contractHash: creativeSession.contract.hash, planHash: creativeSession.planHash } } : {}) },
+                stages: Object.keys(r.stages ?? {}),
+                checkpointDir: `checkpoints/${input.projectId}`,
+                ...(promptsArtifact
+                  ? {
+                      promptsRef: `stages/preproduction/attempt-${ctx.attempt}.prompts.json`,
+                      promptsSha256: promptsArtifact.sha256,
+                      promptShotCount: promptPack!.shotCount,
+                    }
+                  : {}),
+                ...(shotlistArtifact ? {
+                  cliShotlistRef: `stages/preproduction/attempt-${ctx.attempt}.shotlist.json`,
+                  cliShotlistSha256: shotlistArtifact.sha256,
+                } : {}),
+                ...(shotlistArtifact && selectedScenePolicy.policy
+                  ? {
+                      shotlistRef: `stages/preproduction/attempt-${ctx.attempt}.shotlist.json`,
+                      shotlistSha256: shotlistArtifact.sha256,
+                    }
+                  : {}),
+                ...(scenePolicyReportArtifact
+                  ? {
+                      scenePolicyReportRef,
+                      scenePolicyReportSha256: scenePolicyReportArtifact.sha256,
+                      scenePolicyPassed: scenePolicyReport!.passed,
+                    }
+                  : {}),
+                ...(preCheckpoints.files > 0
+                  ? {
+                      preCheckpointSnapshot: {
+                        dir: `checkpoints/attempt-${ctx.attempt}-before`,
+                        files: preCheckpoints.files,
+                        bytes: preCheckpoints.bytes,
+                        resumed: vendorResumed,
+                      },
+                    }
+                  : {}),
+                resumed: vendorResumed,
+                degraded: vendorDegraded,
+                ...(failureMessage && !r.success ? { failureMessage } : {}),
+                ...(vendorErrors.length ? { failures: vendorErrors } : {}),
+                ...(!r.success ? { vendorConfirmations: structuredClone(r.confirmations ?? {}) } : {}),
+                ...(dm
+                  ? {
+                      dossier: {
+                        root: marketingDossierRef ?? `dossiers/${scope.workspaceId}`,
+                        productId: dm.product_id ?? null,
+                        evidenceCount: Array.isArray(dm.data?.dossier?.provenance)
+                          ? dm.data!.dossier!.provenance!.length
+                          : 0,
+                      },
+                    }
+                  : {}),
+              },
+              ...(outcome ? { outcome } : {}),
+            };
+          },
+        );
+        if (!rawResult) throw new Error("预生产档案执行器未返回业务结果");
+        return rawResult;
+      };
+      const runEnforced = async () => {
+        const result = await runOnce();
+        if (result.success && creativeSession) {
+          if (!finalCreativeRenderBinding) throw new Error("CREATIVE_HANDOFF_UNVERIFIED: successful run has no exact archived prompt binding");
+          await creativeSession.completeStage("final", { result: JSON.parse(JSON.stringify(result)), renderBinding: finalCreativeRenderBinding });
+        }
+        return result;
+      };
+      let result = creativeSession
+        ? await withCreativeExternalBudget(creativeSession, () => withCreativeBudget({ beforeModelCall: request => creativeSession!.beforeModelCall(request),
+          afterModelCall: (reservation, outcome) => creativeSession!.afterModelCall(reservation, outcome),
+          externalCall: dispatchCreativeExternalCall,
+          shouldAbort: () => entry.aborted || creativeSession!.shouldAbort() }, runEnforced))
+        : await runOnce();
+      let attempts = 1;
+      while (attempts < maxAttempts && isProducerRejection(result)) {
+        attempts += 1;
+        console.log(`[studio-worker] AI 监制打回 → 自动重跑第 ${attempts}/${maxAttempts} 次（同一项目、同一门口径）`);
+        result = await runOnce();
+      }
+      if (controlMode === "shadow") {
+        try {
+          const receipt = observeCreativeShadow({ input: { scope: { ...scope, projectId: input.projectId },
+            rawIntent: input.rawIntent ?? input.intent, metadata: sourceMetadata, isMarketing: input.isMarketing === true,
+            ...(shadowG1 ? { facts: creativeFactsFromG1(shadowG1) } : {}) }, baseline: { ready: result.success,
+            hardFindings: [...gateProofs.values()].filter(proof => !["passed", "not_applicable"].includes(String(proof.status)))
+              .map(proof => `${String(proof.gate)}:${String(proof.status)}`), output: result } });
+          await archive.appendJsonl("events.jsonl", { kind: "creative.shadow.compared", runId: entry.runId, at: new Date().toISOString(), ...receipt });
+        } catch (error) {
+          console.warn(`[creative-shadow] comparison unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      // Report finished only after the creative journal accepted the final
+      // bound artifact. The finalizer below is also used for failed runs.
+      if (result.success && creativeSession) { await creativeSession.finish({ success: true }); creativeSessionFinished = true; }
+      entry.status = result.success ? "finished" : "failed";
+      entry.error = result.success ? null : terminalFailureMessageOf(result, entry.error);
+      /** 情报层产出摘要（逐环节审计要看得见"档案到底有没有装订出来"） */
+      const dataMiningStage = (result.stages?.dataMining ?? null) as
+        | { status?: string; product_id?: string; data?: { ok?: boolean; reused?: boolean; dossier?: { gaps?: unknown[]; provenance?: unknown[] } } }
+        | null;
+      entry.resultSummary = {
+        success: result.success,
+        stages: Object.keys(result.stages ?? {}),
+        producerAttempts: attempts,
+        ...(dataMiningStage
+          ? {
+              dataMining: {
+                status: dataMiningStage.status ?? null,
+                productId: dataMiningStage.product_id ?? null,
+                ok: dataMiningStage.data?.ok ?? null,
+                reused: dataMiningStage.data?.reused ?? null,
+                evidenceCount: Array.isArray(dataMiningStage.data?.dossier?.provenance)
+                  ? dataMiningStage.data!.dossier!.provenance!.length
+                  : null,
+                gaps: Array.isArray(dataMiningStage.data?.dossier?.gaps)
+                  ? dataMiningStage.data!.dossier!.gaps!.length
+                  : null,
+              },
+            }
+          : {}),
+      };
+
+      /**
+       * 媒资库自动入库（T-2026-0926-0007 规格书 §3.4）：
+       * 定妆照/商品图批量入库（kind=portrait / product_image）+ 营销管线商品档案投影。
+       * 旁路写：整体 try/catch，任何失败只记日志，**不改 run 终态**（素材入库不该推翻"片子跑完了"）。
+       */
+      if ((process.env.MEDIA_INGEST_ENABLED ?? "1") !== "0") {
+        try {
+          const portraits = await ingestPortraitsFromIndex(getAppPool(), getGatewayPool(), scope, {
+            projectId: input.projectId,
+            pipelineKind: input.isMarketing ? "marketing" : "narrative",
+            indexPath: portraitIndexPath,
+            by: "video-studio",
+          });
+          if (portraits.scanned > 0) {
+            console.log(
+              `[media-ingest] 定妆照/商品图入库：扫描 ${portraits.scanned}，新增 ${portraits.ingested}，`
+              + `去重 ${portraits.deduped}，跳过 ${portraits.skipped}，失败 ${portraits.errors.length}`,
+            );
+          }
+          for (const error of portraits.errors.slice(0, 5)) console.warn(`[media-ingest] 单张入库失败：${error}`);
+        } catch (err) {
+          console.error(`[media-ingest] 定妆照入库失败（不影响 run 终态）：${(err as Error).message}`);
+        }
+        const minedProductId = dataMiningStage?.product_id ?? null;
+        if (input.isMarketing && minedProductId) {
+          try {
+            const profile = await upsertProductProfileFromDossier(getAppPool(), getGatewayPool(), scope, {
+              dossierRoot: marketingDossierRoot ?? path.join(WORK_DIR, "dossiers", scope.workspaceId),
+              productId: minedProductId,
+              by: "video-studio",
+            });
+            console.log(
+              `[media-ingest] 商品档案投影：${profile.profile.productName}`
+              + `（sha256 ${profile.profile.dossierSha256.slice(0, 12)}…，内容变化=${profile.changed}，主图新入库=${profile.heroIngested}）`,
+            );
+          } catch (err) {
+            console.error(`[media-ingest] 商品档案投影失败（不影响 run 终态）：${(err as Error).message}`);
+          }
+        }
+      }
+      /** 终态交接包（改动 D）：跨会话承接只凭 projectId + 档案夹即可续跑，不依赖原始上下文 */
+      if (archive) {
+        try {
+          const producerRejected = isProducerRejection(result);
+          const terminalFailureMessage = terminalFailureMessageOf(result, entry.error);
+          await updateContextBundle(archive, {
+            pipelineKind,
+            threadId: projectMeta?.threadId ?? null,
+            lastStage: "preproduction",
+            ...(result.success
+              ? {}
+              : {
+                  failedStage: "preproduction",
+                  /**
+                   * 软失败口径（真机审计发现 D2）：vendor 返回 `success:false` 时不一定抛异常，
+                   * `entry.error` 常为空字符串——用 `??` 会落进 `new Error("")` 被判成 BUG（误升级 P0）。
+                   * 这里按"异常 → result.error → vendor failures[] → 通用兜底"顺序取真实原因。
+                   */
+                  errorClass: producerRejected
+                    ? "GATE_REJECTED"
+                    : classifyError(new Error(terminalFailureMessage)),
+                  errorMsg: terminalFailureMessage.slice(0, 500),
+                }),
+            decisions: [
+              `预生产${result.success ? "完成" : "**未成功**"}（归档 attempt=${stageRef.attempt || "-"}；本次运行内重试 ${attempts} 次；内部环节 ${Object.keys(result.stages ?? {}).length} 个）`,
+              ...decisionLog,
+              ...(dataMiningStage
+                ? [
+                    `情报档案：${marketingDossierRef ?? `dossiers/${scope.workspaceId}`}（商品 ${dataMiningStage.product_id ?? "未标注"}，证据 ${
+                      Array.isArray(dataMiningStage.data?.dossier?.provenance)
+                        ? dataMiningStage.data!.dossier!.provenance!.length
+                        : 0
+                    } 条）`,
+                  ]
+                : []),
+            ],
+            ...(result.success
+              ? { nextSteps: ["预生产完成 → 渲染提交（video.render.submit）或按交付包进入后期/交付段"] }
+              : {}),
+          });
+        } catch (err) {
+          console.error(`[archive] 交接包写入失败（不影响运行）: ${(err as Error).message}`);
+        }
+      }
+    } catch (err) {
+      entry.status = "failed";
+      entry.error = err instanceof Error ? err.message : String(err);
+      // 元数据尚未验证时，不为不存在/越权的项目创建失败档案。
+      if (projectMeta) {
+        try {
+          await updateContextBundle(archive, {
+            pipelineKind,
+            threadId: projectMeta?.threadId ?? null,
+            failedStage: "preproduction",
+            errorClass: classifyError(err),
+            errorMsg: entry.error,
+            decisions: decisionLog,
+          });
+        } catch (bundleErr) {
+          console.error(`[archive] 失败交接包写入失败: ${(bundleErr as Error).message}`);
+        }
+      }
+    } finally {
+      // 一个清理失败不能跳过其余清理；租约解锁异常由宿主销毁连接，终态仍诚实报告失败。
+      for (const cleanup of [
+        () => creativeSessionFinished ? undefined : creativeSession?.finish({ success: entry.status === "finished", ...(entry.error ? { error: entry.error } : {}) }),
+        () => detachStructuredLog?.(),
+        () => activeLease?.release(),
+        restoreRunLogs,
+        uninstallPortraitBinding,
+      ]) {
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          entry.status = "failed";
+          entry.error = [entry.error, `运行清理失败：${message}`].filter(Boolean).join("；");
+          console.error(`[studio-worker] ${entry.error}`);
+        }
+      }
+      if (shadowObserver && shadowExpectedPlan) {
+        try {
+          const shadowRunId = await shadowObserver.finalize({
+            success: entry.status === "finished",
+            pipelineKind,
+            intent: input.intent,
+            observedGates: [...gateProofs.values()],
+            expectedPlan: shadowExpectedPlan,
+          });
+          if (shadowRunId) console.log(`[pipeline-shadow] observed legacy run ${entry.runId} as ${shadowRunId}`);
+        } catch (shadowError) {
+          console.warn(
+            `[pipeline-shadow] observation failed without affecting legacy run: `
+            + `${shadowError instanceof Error ? shadowError.message : String(shadowError)}`,
+          );
+        }
+      }
+      entry.finishedAt = new Date().toISOString();
+    }
+  })();
+
+  return entry.runId;
+}
+
+/**
+ * 建视频项目 + 启动标准预生产管线（唯一入口，2026-09-21）：
+ *   - video.studio.start（视频页面手起）与 threads.dispatch（右栏「派」识别出视频目标）共用同一条链路，
+ *     避免"内容类目标走通用 Quest 规划器、把内部流转步骤照单执行"的分叉；
+ *   - 建档行与建档事件同一事务（D16 同口径）；threadId 传入时把任务线程与视频项目关联，
+ *     任务详情/时间线因此能看到「已转入标准视频管线」。
+ */
+export interface StartVideoProjectInput {
+  intent: string;
+  rawIntent?: string;
+  /** 分流器写入商品信息之前的客户 metadata，供片型选择只取客户来源证据。 */
+  customerMetadata?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown>;
+  /** 调用方显式指定的目标平台（ID 或中文别名）；缺省由需求文本识别，仍缺省则走抖音口径。 */
+  platform?: string;
+  isMarketing?: boolean;
+  by: { id: string; type: "human" | "system" };
+  threadId?: string;
+}
+
+export async function startVideoProjectRun(
+  scope: { tenantId: string; workspaceId: string },
+  input: StartVideoProjectInput,
+): Promise<{ projectId: string; runId: string }> {
+  const selectionMetadata = Object.hasOwn(input, "customerMetadata") ? input.customerMetadata ?? undefined : input.metadata;
+  const selectedScenePolicy = resolveScenePolicyForIntent(input.rawIntent ?? input.intent, selectionMetadata);
+  const selectedPlatform = resolvePlatformForIntent(input.rawIntent ?? input.intent, selectionMetadata, input.platform);
+  const selectedBuiltinCharacters = resolveBuiltinCharacters(input.rawIntent ?? input.intent, selectionMetadata);
+  const platformMetadata: Record<string, unknown> = {
+    ...(input.metadata ?? {}),
+    platform: selectedPlatform.decision.id,
+    platformSelection: selectedPlatform.decision,
+  };
+  const client = await getAppPool().connect();
+  let projectId = "";
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
+    await client.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
+    // GR-02（2026-09-29 第二次修复）：视频项目号与线程号同口径——纯 nextval 取号 + SAVEPOINT 换号重试
+    const kind = input.isMarketing ? "marketing" : "narrative";
+    projectId = (await insertWithReadableId(client, VIDEO_PROJECT_ID_SOURCE, async (id) => {
+      await client.query(
+        `INSERT INTO video_projects (id, workspace_id, title, kind, created_by)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [id, scope.workspaceId, input.intent.slice(0, 200), kind, input.by.id],
+      );
+      return id;
+    })).id;
+    await gatewayAppendOnClient(client, {
+      ...scope,
+      actor: { ...input.by },
+      ...(input.threadId ? { sessionId: input.threadId } : {}),
+    }, {
+      who: { ...input.by },
+      context: {
+        tenant_id: scope.tenantId, workspace_id: scope.workspaceId,
+        time: new Date().toISOString(), channel: "inapp",
+      },
+      object: { type: "video_project", id: projectId },
+      decision: {
+        action: "video.project.create",
+        after: {
+          projectId, kind, intent: input.intent.slice(0, 500),
+          scenePolicy: selectedScenePolicy.decision,
+          platform: selectedPlatform.decision,
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+        },
+        basis: ["视频标准管线立项（§5：一部片子/一个营销 Campaign）"],
+      },
+      rule_impact: [],
+    });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+  const runId = startRun(scope, {
+    projectId,
+    intent: input.intent,
+    metadata: platformMetadata,
+    isMarketing: input.isMarketing,
+    rawIntent: input.rawIntent,
+    customerMetadata: selectionMetadata ?? null,
+    selectedScenePolicy,
+    selectedPlatform,
+    selectedBuiltinCharacters,
+  });
+  return { projectId, runId };
+}

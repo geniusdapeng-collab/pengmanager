@@ -53,7 +53,7 @@ export function createVideoRuntime(options = {}) {
     }
     const pin=JSON.parse(fs.readFileSync(path.join(config.rootDir,'upstreams','workloom-video-edit.pin.json'),'utf8'));
     if(pin.commit!==config.sourceMain||pin.sourceFileCount!==config.sourceFileCount)throw new VideoRuntimeError('ENGINE_PIN_MISMATCH','The embedded video engine does not match the reviewed complete snapshot.');
-    inventoryValidation=verifyPinnedSnapshot({rootDir:config.rootDir,engineRoot:config.engineRoot,commit:config.sourceMain,fileCount:config.sourceFileCount,expectedSha256:pin.snapshotSha256});
+    inventoryValidation=verifyPinnedSnapshot({rootDir:config.rootDir,engineRoot:config.engineRoot,commit:config.sourceMain,fileCount:config.sourceFileCount,expectedSha256:pin.snapshotSha256,distribution:pin.distribution??'complete'});
   }
   function verifyEngine({inventoryVerified=false}={}) {
     if(!inventoryVerified)verifyEngineInventory();
@@ -106,7 +106,7 @@ export function createVideoRuntime(options = {}) {
       if(failed.length)throw new VideoRuntimeError('TOOLS_INSTALL_INCOMPLETE',`Managed local media installation is incomplete for: ${failed.join(', ')}. Review the private tools installation receipt, then rerun video-setup.`);
     }
     assertActive(signal);
-    atomicJson(path.join(config.dataRoot,'setup-receipt.json'),{schemaVersion:'pengmanager.video-setup/v1',sourceMain:config.sourceMain,workspaceId:SCOPE.workspaceId,completeSnapshot:true,inventoryValidation,simulatedBusinessData:false,setupAt:new Date().toISOString()});
+    atomicJson(path.join(config.dataRoot,'setup-receipt.json'),{schemaVersion:'pengmanager.video-setup/v1',sourceMain:config.sourceMain,workspaceId:SCOPE.workspaceId,completeSnapshot:inventoryValidation.distribution==='complete',inventoryValidation,simulatedBusinessData:false,setupAt:new Date().toISOString()});
   }
   async function packageCommand(args,{signal,log:logName,timeoutMs}){
     const {command,prefix}=packageManagerInvocation(config);

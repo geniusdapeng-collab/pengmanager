@@ -10,7 +10,7 @@ import { assertGenericPublicNaming } from "../src/domain/content-ops-quality.mjs
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { demoSeedDirectory } from "../scripts/demo.mjs";
 import { JsonStore } from "../src/storage/json-store.mjs";
 import { loadSeedState } from "../src/services/bootstrap.mjs";
 import { GeoOsService } from "../src/services/geo-os-service.mjs";
@@ -107,7 +107,7 @@ test("legacy article ingress and approval use the same naming policy", async t =
   const directory = await mkdtemp(join(await realpath(tmpdir()), "pengmanager-naming-test-"));
   const store = new JsonStore({ filePath: join(directory, "state.json") });
   t.after(async () => { await store.close(); await rm(directory, { recursive: true, force: true }); });
-  await store.open(() => loadSeedState(fileURLToPath(new URL("../data/seed/", import.meta.url))));
+  await store.open(() => loadSeedState(demoSeedDirectory));
   const geoService = new GeoOsService({ store });
   const content = await geoService.createContent({
     title: "WorkLoom 的经营边界",

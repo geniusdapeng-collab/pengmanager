@@ -1,0 +1,343 @@
+/** 营销事实来源：只抓取逐跳核验后的公网正文，固定 DNS，保存完整字节而非搜索摘要。 */
+import { lookup } from "node:dns/promises";
+import { request as httpRequest, type IncomingHttpHeaders, type RequestOptions } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
+import { createHash } from "node:crypto";
+
+export const SOURCE_MAX_BYTES = 2 * 1024 * 1024;
+export const SOURCE_MAX_TEXT_CHARS = 64_000;
+export interface SourceSnapshot {
+  sourceId: string; requestedUrl: string; finalUrl: string; redirectChain: string[];
+  fetchedAt: string; contentType: string; rawSha256: string; textSha256: string;
+  bytes: number; text: string; assetUrls: string[];
+}
+export interface SourceResponse { status: number; headers: IncomingHttpHeaders; body: Buffer }
+export type SourceResolver = (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+export type SourceTransport = (url: URL, address: { address: string; family: number }, signal: AbortSignal) => Promise<SourceResponse>;
+
+export interface BookingSourceFixture {
+  schemaVersion: "workloom.booking-source/v1";
+  requestedUrl: string;
+  finalUrl: string;
+  contentType: "text/plain";
+  text: string;
+  fetchedAt: string;
+  rawSha256: string;
+  textSha256: string;
+  bytes: number;
+  repository: string;
+  defaultBranch: string;
+  repositoryApiUrl: string;
+  readmeApiUrl: string;
+  readmeSha: string;
+}
+
+export function publicSourceAddress(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    const [a = 0, b = 0, c = 0] = address.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 || a === 100 && b >= 64 && b <= 127
+      || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && (b === 168 || b === 0)
+      || a === 198 && (b === 18 || b === 19 || b === 51 && c === 100) || a === 203 && b === 0 && c === 113);
+  }
+  // 只准许全球单播 2000::/3；映射IPv4、ULA、链路本地、组播和隧道/文档地址均不进入网络。
+  if (family === 6) {
+    const groups = address.toLowerCase().split(":"); const first = parseInt(groups[0]!, 16), second = parseInt(groups[1] || "0", 16);
+    return first >= 0x2000 && first <= 0x3fff && first !== 0x2002
+      && !(first === 0x2001 && (second === 0 || second === 0xdb8 || second >= 0x10 && second <= 0x2f));
+  }
+  return false;
+}
+
+export function sourceUrl(raw: string): URL {
+  let url: URL;
+  try { url = new URL(raw); } catch { throw new Error("SOURCE_URL_INVALID：来源不是有效网址"); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.port) {
+    throw new Error("SOURCE_URL_INVALID：来源只接受无凭据的标准 HTTP/HTTPS 公网页面");
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || /\.(localhost|local|internal|test|invalid)$/.test(host)) throw new Error("SOURCE_URL_PRIVATE：内部或测试域名不能作正式来源");
+  if (isIP(host) && !publicSourceAddress(host)) throw new Error("SOURCE_URL_PRIVATE：来源不能使用非公网IP");
+  url.hash = "";
+  return url;
+}
+
+/** Keep the original URL/TLS identity while connecting only to the approved address. */
+export function pinnedSourceRequestOptions(address: { address: string; family: number }, signal: AbortSignal,
+  headers: Record<string, string>): RequestOptions {
+  return {
+    method: "GET", agent: false, signal, family: address.family,
+    headers: { "user-agent": "WorkLoom-FactSource/1.0", ...headers, "accept-encoding": "identity" },
+    lookup: ((_hostname: string, options: { all?: boolean }, done: (...args: unknown[]) => void) => {
+      if (options.all) done(null, [address]); else done(null, address.address, address.family);
+    }) as RequestOptions["lookup"],
+  };
+}
+
+const requestBoundedSource = (maxBytes: number, accept: string): SourceTransport => (url, address, signal) => new Promise((resolve, reject) => {
+  const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, pinnedSourceRequestOptions(address, signal, { accept }), response => {
+    response.once("error", reject);
+    if (Number(response.headers["content-length"] ?? 0) > maxBytes) { response.destroy(new Error("SOURCE_TOO_LARGE：来源响应超过读取上限")); return; }
+    const chunks: Buffer[] = []; let bytes = 0;
+    response.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > maxBytes) { response.destroy(new Error("SOURCE_TOO_LARGE：来源响应超过读取上限")); return; }
+      chunks.push(Buffer.from(chunk));
+    });
+    response.once("aborted", () => reject(new Error("SOURCE_ABORTED：来源响应中途断开")));
+    response.once("end", () => resolve({ status: response.statusCode ?? 0, headers: response.headers, body: Buffer.concat(chunks) }));
+  });
+  request.once("error", reject);
+  request.end();
+});
+/** 低层传输独立导出供真实本地 HTTP 回归；业务访问必须先核验公网目标。 */
+export const requestSource: SourceTransport = requestBoundedSource(SOURCE_MAX_BYTES, "text/html,text/plain,application/json");
+
+function decodeEntities(text: string): string {
+  const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+  return text.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (all, entity: string) => {
+    if (entity.startsWith("#")) {
+      const value = parseInt(entity.slice(/^#x/i.test(entity) ? 2 : 1), /^#x/i.test(entity) ? 16 : 10);
+      return value > 0 && value <= 0x10ffff ? String.fromCodePoint(value) : all;
+    }
+    return named[entity.toLowerCase()] ?? all;
+  });
+}
+
+/** 只收集候选，不替浏览器做画幅/密度选择；URL 内的逗号不能直接按 split(",") 切开。 */
+function srcsetCandidates(value: string): string[] {
+  const urls: string[] = []; let position = 0;
+  while (position < value.length) {
+    while (/[\t\n\f\r ,]/.test(value[position] ?? "") && position < value.length) position++;
+    const start = position;
+    while (position < value.length && !/[\t\n\f\r ]/.test(value[position]!)) position++;
+    let url = value.slice(start, position);
+    if (!url) continue;
+    if (url.endsWith(",")) { urls.push(url.replace(/,+$/, "")); continue; }
+    const descriptorStart = position; let parentheses = 0;
+    while (position < value.length) {
+      const character = value[position]!;
+      if (character === "," && parentheses === 0) break;
+      if (character === "(") parentheses++;
+      if (character === ")" && parentheses > 0) parentheses--;
+      position++;
+    }
+    const descriptors = value.slice(descriptorStart, position).trim();
+    if (!descriptors || /^\d+w$/.test(descriptors) && Number(descriptors.slice(0, -1)) > 0
+      || /^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?x$/i.test(descriptors) && Number.isFinite(Number(descriptors.slice(0, -1))) && Number(descriptors.slice(0, -1)) > 0) urls.push(url);
+    if (value[position] === ",") position++;
+  }
+  return urls;
+}
+
+/** 有界 token 扫描避免把脚本、样式、注释和嵌套模板内的字符串误作真实图片。 */
+function sourceImageCandidates(raw: string): string[] {
+  const urls: string[] = []; let templateDepth = 0;
+  const tags = /<!--[\s\S]*?(?:-->|$)|<(\/?)([a-z][a-z0-9:-]*)(?=[\t\n\f\r />])(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = tags.exec(raw)) !== null) {
+    const name = match[2]?.toLowerCase();
+    if (!name) continue;
+    const closing = match[1] === "/";
+    if (!closing && ["script", "style", "noscript"].includes(name)) {
+      // raw-text 内的 <!-- / <img> 是字符串，不能让通用 token 扫描吞掉真实结束标签。
+      const endTag = new RegExp(`</${name}(?=[\\t\\n\\f\\r />])[^>]*>`, "gi");
+      endTag.lastIndex = tags.lastIndex;
+      if (!endTag.exec(raw)) break;
+      tags.lastIndex = endTag.lastIndex;
+      continue;
+    }
+    if (name === "template") { templateDepth = Math.max(0, templateDepth + (closing ? -1 : 1)); continue; }
+    if (closing || templateDepth > 0 || name !== "img" && name !== "source") continue;
+    const attributes = new Map<string, string>();
+    for (const attribute of match[0].matchAll(/([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g)) {
+      const key = attribute[1]!.toLowerCase();
+      if (!attributes.has(key)) attributes.set(key, decodeEntities(attribute[2] ?? attribute[3] ?? attribute[4] ?? "").trim());
+    }
+    // 原图和响应式候选先于 src 占位图，全部仍由 sourceUrl 执行公网 URL 校验。
+    for (const key of ["data-original", "data-src-original", "data-lazy-src", "data-src", "srcset", "data-srcset", "source-srcset", "src"]) {
+      const value = attributes.get(key);
+      if (value) urls.push(...(key.endsWith("srcset") ? srcsetCandidates(value) : [value]));
+    }
+  }
+  return urls;
+}
+
+export function sourceDocument(raw: string, contentType: string, finalUrl: string): { text: string; assetUrls: string[] } {
+  const html = /(?:html|xhtml)/i.test(contentType);
+  const assetUrls = new Set<string>();
+  if (html) for (const candidate of sourceImageCandidates(raw)) {
+    try { const url = sourceUrl(new URL(candidate, finalUrl).href); assetUrls.add(url.href); } catch { /* 非公网图片不进入候选 */ }
+  }
+  const visible = html ? raw.replace(/<!--[\s\S]*?-->/g, " ").replace(/<(script|style|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<(?:br|\/p|\/div|\/li|\/h[1-6]|\/tr)[^>]*>/gi, "\n").replace(/<[^>]*>/g, " ") : raw;
+  const text = decodeEntities(visible).replace(/\r\n?/g, "\n").replace(/[\t \f]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!text || /(?:请输入验证码|访问过于频繁|请完成安全验证|verify you are human|checking your browser)/i.test(text)
+    || text.length < 200 && /(?:搜索\s*Agent[，,：:\s]*你的?全能搜索助手|全能搜索助手|search\s*agent.*search assistant)/i.test(text)) {
+    throw new Error("SOURCE_UNAVAILABLE：页面为空、访问验证页或搜索助手占位页");
+  }
+  if (text.length > SOURCE_MAX_TEXT_CHARS) throw new Error("SOURCE_TEXT_TOO_LARGE：完整正文超过单来源审核上限，不能截断后作为证据");
+  return { text, assetUrls: [...assetUrls] };
+}
+
+/** Read a booked official-source snapshot for deterministic pre-render pressure runs. */
+export function loadBookingSourceFixture(
+  value: unknown,
+  expectedRequestedUrl?: string,
+): { snapshot: SourceSnapshot; rawBytes: Buffer } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("SOURCE_FIXTURE_INVALID：来源夹具必须是对象");
+  const fixture = value as Partial<BookingSourceFixture>;
+  const requested = sourceUrl(String(fixture.requestedUrl ?? ""));
+  const final = sourceUrl(String(fixture.finalUrl ?? ""));
+  if (expectedRequestedUrl && sourceUrl(expectedRequestedUrl).href !== requested.href) {
+    throw new Error("SOURCE_FIXTURE_MISMATCH：夹具与本次检索 URL 不一致");
+  }
+  if (fixture.schemaVersion !== "workloom.booking-source/v1" || fixture.contentType !== "text/plain"
+    || typeof fixture.text !== "string" || !fixture.text.trim()
+    || typeof fixture.repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(fixture.repository)
+    || typeof fixture.defaultBranch !== "string" || !fixture.defaultBranch.trim()
+    || typeof fixture.repositoryApiUrl !== "string" || !/^https:\/\/api\.github\.com\//u.test(fixture.repositoryApiUrl)
+    || typeof fixture.readmeApiUrl !== "string" || !/^https:\/\/api\.github\.com\//u.test(fixture.readmeApiUrl)
+    || typeof fixture.readmeSha !== "string" || !/^[a-f0-9]{40}$/u.test(fixture.readmeSha)
+    || typeof fixture.fetchedAt !== "string" || !Number.isFinite(Date.parse(fixture.fetchedAt))) {
+    throw new Error("SOURCE_FIXTURE_INVALID：官方来源夹具字段不完整");
+  }
+  const rawBytes = Buffer.from(fixture.text);
+  const text = sourceDocument(fixture.text, fixture.contentType, final.href).text;
+  const rawDigest = createHash("sha256").update(rawBytes).digest("hex");
+  const textDigest = createHash("sha256").update(text).digest("hex");
+  const bytes = rawBytes.length;
+  if (!/^[a-f0-9]{64}$/u.test(String(fixture.rawSha256)) || fixture.rawSha256 !== rawDigest
+    || !/^[a-f0-9]{64}$/u.test(String(fixture.textSha256)) || fixture.textSha256 !== textDigest
+    || fixture.bytes !== bytes) {
+    throw new Error("SOURCE_FIXTURE_CHANGED：官方来源夹具正文与摘要不一致");
+  }
+  const sourceId = `SRC-${createHash("sha256").update(`${final.href}\n${textDigest}`).digest("hex").slice(0, 24)}`;
+  return {
+    snapshot: {
+      sourceId,
+      requestedUrl: requested.href,
+      finalUrl: final.href,
+      redirectChain: requested.href === final.href ? [] : [requested.href],
+      fetchedAt: fixture.fetchedAt,
+      contentType: fixture.contentType,
+      rawSha256: rawDigest,
+      textSha256: textDigest,
+      bytes,
+      text,
+      assetUrls: [],
+    },
+    rawBytes,
+  };
+}
+
+async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => { cleanup(); reject(signal.reason); };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+  });
+}
+
+export async function resolvePublicSourceTarget(rawUrl: string, signal: AbortSignal,
+  resolve: SourceResolver = hostname => lookup(hostname, { all: true, verbatim: true }),
+): Promise<{ url: URL; address: { address: string; family: number } }> {
+  const url = sourceUrl(rawUrl), hostname = url.hostname.replace(/^\[|\]$/g, "");
+  signal.throwIfAborted();
+  const addresses = isIP(hostname) ? [{ address: hostname, family: isIP(hostname) }] : await abortable(resolve(hostname), signal);
+  signal.throwIfAborted();
+  if (addresses.length === 0 || addresses.some(address => !publicSourceAddress(address.address))) throw new Error("SOURCE_URL_PRIVATE：来源解析到非公网地址");
+  return { url, address: addresses[0]! };
+}
+
+async function fetchPinnedSource(rawUrl: string, options: { resolver?: SourceResolver; transport: SourceTransport; timeoutMs: number; maxBytes: number }) {
+  const signal = AbortSignal.timeout(options.timeoutMs);
+  const requested = sourceUrl(rawUrl); let current = requested;
+  const chain: string[] = [];
+  for (let hop = 0; hop <= 4; hop++) {
+    const target = await resolvePublicSourceTarget(current.href, signal, options.resolver);
+    const result = await abortable(options.transport(target.url, target.address, signal), signal);
+    if (result.body.length > options.maxBytes) throw new Error("SOURCE_TOO_LARGE：来源响应超过读取上限");
+    if ([301, 302, 303, 307, 308].includes(result.status)) {
+      if (hop === 4 || !result.headers.location) throw new Error("SOURCE_REDIRECT_INVALID：来源重定向过多或缺目标");
+      chain.push(current.href); current = sourceUrl(new URL(result.headers.location, current).href); continue;
+    }
+    if (result.status !== 200) throw new Error(`SOURCE_HTTP_FAILED：来源HTTP ${result.status}`);
+    return { requested, current, chain, result };
+  }
+  throw new Error("SOURCE_REDIRECT_INVALID：来源重定向未完成");
+}
+
+export async function fetchMarketingSource(rawUrl: string, options: {
+  resolver?: SourceResolver; transport?: SourceTransport; timeoutMs?: number;
+} = {}): Promise<{ snapshot: SourceSnapshot; rawBytes: Buffer }> {
+  const { requested, current, chain, result } = await fetchPinnedSource(rawUrl, { resolver: options.resolver,
+    transport: options.transport ?? requestSource, timeoutMs: options.timeoutMs ?? 15_000, maxBytes: SOURCE_MAX_BYTES });
+  const contentType = String(result.headers["content-type"] ?? "");
+  if (!/^(text\/(?:html|plain)|application\/(?:json|xhtml\+xml))(?:;|$)/i.test(contentType)) throw new Error("SOURCE_TYPE_UNSUPPORTED：来源不是可读取的HTML、文本或JSON正文");
+  let decoded = result.body;
+  const encoding = result.headers["content-encoding"];
+  if (encoding && encoding !== "identity") {
+    const decode = encoding === "gzip" ? gunzipSync : encoding === "deflate" ? inflateSync : encoding === "br" ? brotliDecompressSync : null;
+    if (!decode) throw new Error("SOURCE_ENCODING_UNSUPPORTED：来源压缩格式不支持");
+    decoded = decode(decoded, { maxOutputLength: SOURCE_MAX_BYTES });
+  }
+  if (!decoded.length || decoded.length > SOURCE_MAX_BYTES) throw new Error("SOURCE_TOO_LARGE：来源字节为空或超过上限");
+  const charset = /charset\s*=\s*["']?([^;\s"']+)/i.exec(contentType)?.[1] ?? "utf-8";
+  const raw = new TextDecoder(charset, { fatal: true }).decode(decoded);
+  const document = sourceDocument(raw, contentType, current.href);
+  const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+  const rawSha256 = hash(decoded), textSha256 = hash(document.text);
+  return { snapshot: { sourceId: `SRC-${hash(`${current.href}\n${textSha256}`).slice(0, 24)}`, requestedUrl: requested.href,
+    finalUrl: current.href, redirectChain: chain, fetchedAt: new Date().toISOString(), contentType,
+    rawSha256, textSha256, bytes: decoded.length, ...document }, rawBytes: decoded };
+}
+
+export async function fetchPublicMarketingImage(rawUrl: string, maxBytes = 15 * 1024 * 1024): Promise<{
+  bytes: Buffer; extension: "png" | "jpg" | "webp"; finalUrl: string;
+}> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > 15 * 1024 * 1024) throw new Error("SOURCE_IMAGE_LIMIT_INVALID");
+  const { current, result } = await fetchPinnedSource(rawUrl, { maxBytes, timeoutMs: 20_000,
+    transport: requestBoundedSource(maxBytes, "image/png,image/jpeg,image/webp") });
+  const { body: bytes } = result;
+  const type = String(result.headers["content-type"] ?? "").split(";")[0]?.toLowerCase();
+  const extension = type === "image/png" && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ? "png"
+    : type === "image/jpeg" && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 ? "jpg"
+      : type === "image/webp" && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP" ? "webp" : null;
+  if (!extension || (result.headers["content-encoding"] && result.headers["content-encoding"] !== "identity")) throw new Error("SOURCE_IMAGE_TYPE_INVALID");
+  return { bytes, extension, finalUrl: current.href };
+}
+
+export function retryableMarketingSourceError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /abort(?:ed)?|timeout|timed out|ECONN|ENOTFOUND|EAI_AGAIN|socket|SOURCE_ABORTED|SOURCE_HTTP_FAILED：来源HTTP (?:429|5\d\d)/iu.test(message);
+}
+
+/** Public GET retry for transient transport/HTTP failures; content-policy failures remain immediate. */
+export async function fetchMarketingSourceWithRetry(rawUrl: string, options: {
+  resolver?: SourceResolver; transport?: SourceTransport;
+  attemptTimeoutsMs?: number[]; retryDelaysMs?: number[];
+} = {}): Promise<{ snapshot: SourceSnapshot; rawBytes: Buffer }> {
+  const attemptTimeoutsMs = options.attemptTimeoutsMs?.length ? options.attemptTimeoutsMs : [15_000, 25_000, 40_000];
+  const retryDelaysMs = options.retryDelaysMs ?? [250, 750];
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attemptTimeoutsMs.length; attempt++) {
+    try {
+      return await fetchMarketingSource(rawUrl, {
+        resolver: options.resolver,
+        transport: options.transport,
+        timeoutMs: attemptTimeoutsMs[attempt],
+      });
+    } catch (error) {
+      lastError = error;
+      if (!retryableMarketingSourceError(error) || attempt === attemptTimeoutsMs.length - 1) throw error;
+      const delay = retryDelaysMs[Math.min(attempt, retryDelaysMs.length - 1)] ?? 0;
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
