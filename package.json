@@ -1,0 +1,45 @@
+{
+  "name": "pengmanager-system",
+  "version": "0.4.2-oss.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "description": "PengManager local-first editorial, publishing and GEO workspace",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.mjs",
+    "start": "node src/server.mjs",
+    "video:setup": "node scripts/video-setup.mjs",
+    "video:doctor": "node scripts/video-doctor.mjs",
+    "video:start": "node scripts/video-start.mjs",
+    "agent": "node scripts/agent.mjs",
+    "agent:guide": "node scripts/agent.mjs guide",
+    "agent:config": "node scripts/ai-workbench.mjs config",
+    "mcp": "node scripts/agent-mcp.mjs",
+    "video:status": "node scripts/agent.mjs status",
+    "video:capabilities": "node scripts/agent.mjs capabilities",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check src/server.mjs && node --check public/app.js",
+    "smoke": "node scripts/smoke.mjs",
+    "demo": "node scripts/demo.mjs",
+    "test:engines": "node --test engines/geo-evidence/test/*.test.mjs",
+    "scan:secrets": "node scripts/security-scan.mjs"
+  },
+  "devDependencies": {
+    "tsx": "4.23.12",
+    "vitest": "3.2.0",
+    "yaml": "2.9.0",
+    "zod": "4.6.5"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "sharp": "0.35.5",
+    "tokenizers": "0.23.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geniusdapeng-collab/pengmanager.git"
+  }
+}
