@@ -14,7 +14,7 @@ export interface OnboardingStatus {
   dataMode: "simulated" | "real";
   persistedDataMode?: "simulated" | "real";
   formalActivationRecorded?: boolean;
-  llm: { provider: string; model: string; baseUrl: string; real: boolean; persistence?: "file" | "process-only" };
+  llm: { provider: string; model: string; baseUrl: string; real: boolean; currentProcessProbeVerified?: boolean; persistence?: "file" | "process-only" };
   workspace: { name: string; events: number; members: number; agents: number; memories: number };
   business?: { name: string; industry: string; note: string; configuredAt: string; source: string } | null;
   bundle?: { id: string | null; isExample: boolean };

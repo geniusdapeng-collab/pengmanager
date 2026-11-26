@@ -19,7 +19,7 @@ import { ApiError } from "../src/domain/errors.mjs";
 import { hashObject } from "../src/domain/hash.mjs";
 import { aiApprovalWorkOrder, judgeAiApproval } from "../src/services/ai-approval.mjs";
 import { ORIGINAL_ILLUSTRATION_REVIEW } from "../src/services/editorial-article-review-evidence.mjs";
-import { TEXT_PRIMARY_MODEL } from "../src/model-routing/registry.mjs";
+import { codexTextRegistration } from "../src/model-routing/codex.mjs";
 import { editorialEditionSnapshot, editorialInput, editorialVariantSnapshot } from "../src/domain/editorial.mjs";
 import { placeArticleIllustrations } from "../src/domain/article-illustrations.mjs";
 import { PNG, MP4 } from "./fixtures/synthetic-media.mjs";
@@ -328,10 +328,10 @@ test("the allowlisted original-copy route preserves literal legacy text, structu
           state.destinations.find(row => row.id === "official-site").policyCheckedAt = "2026-11-16T00:00:00.000Z";
         });
       }
-      const officialModelId = TEXT_PRIMARY_MODEL.officialModelId;
+      const officialModelId = codexTextRegistration().officialModelId;
       return { value: { decision: "approve", rationale: "Synthetic model fixture only.",
         findings: Object.keys(facts.criteria).map(criterion => ({ criterion, status: "pass", reason: "Synthetic contract assertion only." })) },
-      receipt: { schemaVersion: "workloom.model-receipt/v1", policy: { scene: "approval.decision" }, requestedModel: officialModelId,
+      receipt: { schemaVersion: "workloom.model-receipt/v1", policy: { scene: "approval.decision" }, registry: { provider: "openai" }, requestedModel: officialModelId,
         returnedModel: officialModelId, finishReason: "stop", responseId: "isolated-editorial-review-fixture",
         requestHash: snapshotHash, responseHash: snapshotHash, wireSha256: snapshotHash, policyHash: snapshotHash,
         usage: { inputTokens: 10, outputTokens: 3, totalTokens: 13 } } };
@@ -428,7 +428,8 @@ test("the allowlisted original-copy route preserves literal legacy text, structu
   const overrides = await f.call(`/api/editions/${edition.id}/variants`, { method: "POST", etag: edition.etag,
     body: { destinationId: "official-site", title: edition.title } });
   assert.equal(overrides.payload.error.code, "ARTICLE_AUGMENTATION_OVERRIDES_FORBIDDEN");
-  const external = await f.ok("/api/destinations", { method: "POST", body: { platformId: "github", accountId: "github",
+  const githubAccountId = f.store.snapshot().accounts.find(row => row.platform === "GitHub").id;
+  const external = await f.ok("/api/destinations", { method: "POST", body: { platformId: "github", accountId: githubAccountId,
     kind: "repository", name: "Synthetic independent destination", locator: { url: "https://github.com/isolated-fixture/independent-destination" } } }, 201);
   const wrongDestination = await f.call(`/api/editions/${edition.id}/variants`, { method: "POST", etag: edition.etag,
     body: { destinationId: external.id } });

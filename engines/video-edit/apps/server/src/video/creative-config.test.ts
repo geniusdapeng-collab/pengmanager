@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertCreativeConfigurationReady, creativeConfigurationPreflight } from "./creative-config.js";
+import { assertCreativeConfigurationReady, creativeConfigurationPreflight, creativeModelCostMicros } from "./creative-config.js";
 
 const valid = {
   VM_CREATIVE_BUDGET_CNY: "12.5",
@@ -47,5 +47,17 @@ describe("creative budget preflight", () => {
       .toMatchObject({ ready: false, invalid: ["VM_CREATIVE_MODEL_PRICES"] });
     expect(creativeConfigurationPreflight({ ...valid, VM_CREATIVE_MAX_CALLS: "1.5" }, "deepseek-flash"))
       .toMatchObject({ ready: false, invalid: ["VM_CREATIVE_MAX_CALLS"] });
+  });
+});
+
+
+describe("creative model cost policy", () => {
+  it.each(["gpt-6.2-sol", "gpt-6.2-astra"])("prices the full %s request at the measured input tier", model => {
+    const price = { inputCnyPerMillion: 2.5, outputCnyPerMillion: 10 };
+    const reservation = creativeModelCostMicros(272_001, 40, price, model);
+    expect(reservation).toBe(1_360_605);
+    expect(creativeModelCostMicros(272_001, 3, price, model)).toBe(1_360_050);
+    expect(creativeModelCostMicros(272_000, 3, price, model)).toBe(680_030);
+    expect(creativeModelCostMicros(272_001, 3, price)).toBe(680_033);
   });
 });

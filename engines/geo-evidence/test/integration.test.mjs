@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { GeoStore } from "../lib/store.mjs";
 import { GeoEvidenceService } from "../lib/service.mjs";
 import { createGeoStudioServer } from "../server.mjs";
+import { codexTextRegistration } from "../../../src/model-routing/codex.mjs";
 
 async function fixtureRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "geo-evidence-integration-"));
@@ -92,10 +93,61 @@ test("HTTP API serves health, summary and fixtures securely on loopback", async 
   assert.equal(runResponse.status, 200);
   const run = await runResponse.json();
   assert.equal(run.successful, 10);
+  const locked = await fetch(`${base}/api/run`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${localSecret}`, "content-type": "application/json" },
+    body: JSON.stringify({ provider: "codex-search", limit: 1 }),
+  });
+  assert.equal(locked.status, 403);
 
   const html = await fetch(`${base}/`);
   assert.equal(html.status, 200);
   assert.match(await html.text(), /GeoEvidence Studio/);
+});
+
+test("Codex GEO records only provider search sources and preserves that evidence on reanalysis", async t => {
+  const root = await fixtureRoot(t);
+  const store = new GeoStore(join(root, "codex.sqlite"));
+  t.after(() => store.close());
+  const env = { OPENAI_API_KEY: "isolated-test-key" };
+  const model = codexTextRegistration({ env }).officialModelId;
+  let searchCompleted = true;
+  const requests = [];
+  const service = new GeoEvidenceService(store, { rootDir: root, env, fetchImpl: async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push(body);
+    if (String(url).endsWith("/input_tokens")) {
+      return Response.json({ object: "response.input_tokens", input_tokens: 60 });
+    }
+    return Response.json({
+      id: "resp_geo_fixture", model, status: "completed",
+      output: [
+        ...(searchCompleted ? [{ type: "web_search_call", status: "completed",
+          action: { sources: [{ url: "https://publisher.example/evidence" }, { url: "https://source-only.example/uncited" }] } }] : []),
+        { type: "message", role: "assistant", status: "completed", content: [
+          { type: "output_text", text: "带有模型文本链接的回答 [未验证链接](https://model-asserted.example/example)。",
+            annotations: [{ type: "url_citation", title: "实际来源", url: "https://publisher.example/evidence" }] },
+        ] },
+      ],
+      usage: { input_tokens: 60, output_tokens: 30, total_tokens: 90 },
+    });
+  } });
+  assert.equal(service.health().providers["codex-search"], true);
+  await assert.rejects(service.runObservations({ provider: "codex-search", platform: "another-provider", limit: 1 }));
+  assert.equal(requests.length, 0);
+  const run = await service.runObservations({ provider: "codex-search", limit: 1 });
+  assert.equal(run.successful, 1);
+  assert.deepEqual(requests[1].tools, [{ type: "web_search" }]);
+  const getSample = () => store.listSamples({ runId: run.runId, limit: 1 })[0];
+  assert.equal(getSample().raw.modelReceipt.responseId, "resp_geo_fixture");
+  assert.ok(getSample().raw.sources.some(row => row.url === "https://source-only.example/uncited"));
+  assert.deepEqual(getSample().citations.map(row => row.url), ["https://publisher.example/evidence"]);
+  service.reanalyzeRun(run.runId);
+  assert.deepEqual(getSample().citations.map(row => row.url), ["https://publisher.example/evidence"]);
+  searchCompleted = false;
+  const failed = await service.runObservations({ provider: "codex-search", limit: 1 });
+  assert.equal(failed.failed, 1);
+  assert.equal(failed.successful, 0);
 });
 
 test("in-process GEO tool bridge exposes declared tools with receipts", async (t) => {

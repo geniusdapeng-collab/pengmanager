@@ -1,3 +1,5 @@
+import { codexVideoLongContextBilling } from "@workloom/base/model-router";
+
 export const CREATIVE_BUDGET_ENV_KEYS = [
   "VM_CREATIVE_BUDGET_CNY",
   "VM_CREATIVE_MAX_CALLS",
@@ -12,6 +14,14 @@ export interface CreativeBudgetConfig {
   maxTokens: number;
   maxWallMs: number;
   price: { inputCnyPerMillion: number; outputCnyPerMillion: number };
+}
+
+export function creativeModelCostMicros(
+  inputTokens: number, outputTokens: number, price: CreativeBudgetConfig["price"], codexModel?: string,
+): number {
+  const longContext = codexModel !== undefined && codexVideoLongContextBilling(codexModel, inputTokens);
+  return Math.ceil(inputTokens * price.inputCnyPerMillion * (longContext ? 2 : 1)
+    + outputTokens * price.outputCnyPerMillion * (longContext ? 1.5 : 1));
 }
 
 export interface CreativeConfigurationPreflight {

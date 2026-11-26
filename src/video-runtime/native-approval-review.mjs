@@ -1,9 +1,7 @@
 import { articleIllustrationStyleRule } from '../../public/article-illustration-style.js';
-import { resolveDeepSeekApiKey } from '../adapters/auth.mjs';
 import { hashObject } from '../domain/hash.mjs';
 import { scanSensitiveText } from '../domain/policy.mjs';
-import { createModelDispatcher } from '../model-routing/dispatcher.mjs';
-import { textModelRegistration } from '../model-routing/registry.mjs';
+import { CodexModelDispatcher, codexTextRegistration } from '../model-routing/codex.mjs';
 import { articleSceneAiEvidence } from './article-visuals.mjs';
 import { SCOPE, VideoRuntimeError } from './config.mjs';
 
@@ -37,12 +35,9 @@ export function createNativeApprovalReviewer({ dataRoot, env = process.env, disp
   let selectedDispatcher = dispatcher;
   function checkModel() {
     if (!selectedDispatcher) {
-      required(env.LLM_PROVIDER === 'deepseek' || Boolean(env.LLM_API_KEY || env.DEEPSEEK_API_KEY),
-        'NATIVE_APPROVAL_MODEL_NOT_CONFIGURED', '当前原生运行时需要授权的 DeepSeek 进程配置。');
-      const registration = textModelRegistration({ env });
-      const key = resolveDeepSeekApiKey(env);
-      selectedDispatcher = createModelDispatcher({ apiKey: key, baseUrl: registration.baseUrl,
-        model: registration.officialModelId, maxRetries: 0 });
+      required(Boolean(env.OPENAI_API_KEY?.trim()),
+        'NATIVE_APPROVAL_MODEL_NOT_CONFIGURED', '当前原生运行时需要已授权的 OPENAI_API_KEY 进程配置。');
+      selectedDispatcher = new CodexModelDispatcher({ env });
     }
     return selectedDispatcher;
   }
@@ -81,7 +76,8 @@ export function createNativeApprovalReviewer({ dataRoot, env = process.env, disp
     ] });
     const receipt = response.receipt;
     required(receipt?.schemaVersion === 'workloom.model-receipt/v1' && receipt.policy?.scene === 'approval.native' &&
-      receipt.registry?.provider === 'deepseek' && receipt.finishReason === 'stop' && receipt.returnedModel === receipt.requestedModel &&
+      receipt.registry?.provider === 'openai' && receipt.finishReason === 'stop' &&
+      receipt.requestedModel === codexTextRegistration({ env }).officialModelId && receipt.returnedModel === receipt.requestedModel &&
       typeof receipt.responseId === 'string' && receipt.responseId.length > 0 && receipt.responseId.length <= 180 &&
       [receipt.requestHash, receipt.responseHash, receipt.contentHash, receipt.policyHash].every(value => SHA.test(value ?? '')) &&
       [receipt.usage?.inputTokens, receipt.usage?.outputTokens, receipt.usage?.totalTokens].every(value => Number.isSafeInteger(value) && value > 0),

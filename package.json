@@ -1,10 +1,10 @@
 {
   "name": "pengmanager-system",
-  "version": "0.4.2-oss.2",
+  "version": "0.5.0-codex.1",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.25.0",
-  "description": "PengManager local-first editorial, publishing and GEO workspace",
+  "description": "鹏经理Codex版 / PengManager Codex Edition",
   "engines": {
     "node": ">=24"
   },
@@ -22,21 +22,20 @@
     "video:capabilities": "node scripts/agent.mjs capabilities",
     "test": "node scripts/test-source-profile.mjs",
     "test:engines": "node scripts/test-source-profile.mjs --engines",
-    "check": "node --check src/server.mjs && node --check public/app.js",
+    "check": "node --check src/server.mjs && node --check public/app.js && node --check src/model-routing/codex.mjs",
     "acceptance": "node scripts/acceptance.mjs",
     "smoke": "node scripts/smoke.mjs",
     "test:vendor": "node --test --test-concurrency=1 engines/video-edit/bundles/ai-video/connectors/post-bridge/*.test.mjs && vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism engines/video-edit/bundles/ai-video/connectors/cover-kb-bridge/core.test.ts engines/video-edit/bundles/ai-video/connectors/post-bridge/delivery-integration.test.ts engines/video-edit/bundles/ai-video/connectors/post-bridge/post-cli-media.test.ts engines/video-edit/bundles/ai-video/connectors/post-bridge/revision-concurrency.test.ts",
     "test:ci": "node --test --test-concurrency=1 engines/video-edit/bundles/ai-video/connectors/post-bridge/*.test.mjs && vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism engines/video-edit/bundles/ai-video/connectors/cover-kb-bridge/core.test.ts",
-    "live:deepseek": "node scripts/live-deepseek-collect.mjs",
     "live:geoevidence": "node scripts/live-geoevidence.mjs",
     "live:video-edit": "node scripts/live-video-edit.mjs",
-    "live:github": "node scripts/live-github-publish.mjs",
     "live:media": "node scripts/live-media-render.mjs",
     "live:geo": "node scripts/live-geo-integrated.mjs",
     "demo": "node scripts/demo.mjs",
     "scan:secrets": "node scripts/security-scan.mjs",
     "test:public": "node scripts/test-public-profile.mjs",
-    "source:parity": "node scripts/source-parity.mjs"
+    "source:parity": "node scripts/source-parity.mjs",
+    "live:codex": "node scripts/live-codex-collect.mjs"
   },
   "devDependencies": {
     "tsx": "4.23.12",
@@ -51,6 +50,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/geniusdapeng-collab/pengmanager.git"
+    "url": "git+https://github.com/geniusdapeng-collab/pengmanager-codex.git"
   }
 }

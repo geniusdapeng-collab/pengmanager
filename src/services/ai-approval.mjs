@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ApiError } from "../domain/errors.mjs";
 import { editorialSensitiveFindings } from "../domain/editorial.mjs";
 import { hashObject } from "../domain/hash.mjs";
-import { TEXT_PRIMARY_MODEL } from "../model-routing/registry.mjs";
+import { codexTextRegistration } from "../model-routing/codex.mjs";
 import { AI_APPROVAL_MAX_IMAGE_BYTES, AI_APPROVAL_MAX_IMAGE_COUNT } from "./approval-media-evidence.mjs";
 
 const WORK_ORDER = "pengmanager.ai-approval-work-order/v1";
@@ -121,10 +121,27 @@ function verdict(value, order) {
   return value;
 }
 
-function validateProvider(receipt) {
+function acceptsProvider(receipt, modelId, stored) {
+  if (!receipt) return false;
+  if (stored && receipt.requestedModel === "deepseek-flash") {
+    return receipt.registry?.provider === "deepseek";
+  }
+  if (receipt.registry?.provider !== "openai") return false;
+  if (receipt.requestedModel === modelId) return true;
+  if (!stored) return false;
+  try {
+    const prior = codexTextRegistration({ env: { PENGMANAGER_CODEX_MODEL: receipt.requestedModel } });
+    return prior.officialModelId === receipt.requestedModel;
+  } catch {
+    return false;
+  }
+}
+
+function validateProvider(receipt, modelId, { stored = false } = {}) {
   const usage = receipt?.usage;
   assert(receipt?.schemaVersion === "workloom.model-receipt/v1" && receipt.policy?.scene === "approval.decision"
-    && receipt.requestedModel === TEXT_PRIMARY_MODEL.officialModelId && receipt.returnedModel === TEXT_PRIMARY_MODEL.officialModelId
+    && acceptsProvider(receipt, modelId, stored)
+    && receipt.returnedModel === receipt.requestedModel
     && receipt.finishReason === "stop" && ID.test(receipt.responseId ?? "")
     && ["requestHash", "responseHash", "wireSha256", "policyHash"].every(key => SHA.test(receipt[key] ?? ""))
     && ["inputTokens", "outputTokens", "totalTokens"].every(key => Number.isSafeInteger(usage?.[key]) && usage[key] > 0)
@@ -161,7 +178,7 @@ function verifySignature(key, value, signature) {
   return bytes.toString("base64url") === signature && verify(null, signedBytes(value), key, bytes);
 }
 
-export async function judgeAiApproval(input, model, clock = () => new Date()) {
+export async function judgeAiApproval(input, model, clock = () => new Date(), modelId = codexTextRegistration().officialModelId) {
   const order = verifyAiApprovalWorkOrder(input);
   const { images, ...facts } = order;
   const prompt = [
@@ -178,7 +195,7 @@ export async function judgeAiApproval(input, model, clock = () => new Date()) {
     { role: "user", content: images.length ? [user, ...images.map(item => ({ type: "image_url",
       image_url: { url: `data:${item.mime};base64,${item.data}`, detail: "high" } }))] : user.text },
   ] });
-  validateProvider(result.receipt);
+  validateProvider(result.receipt, modelId);
   const decision = verdict(result.value, order);
   return { schema: RECEIPT, actor: "ai-reviewer", kind: order.kind, subjectId: order.subjectId,
     snapshotHash: order.snapshotHash, evidenceHash: order.evidenceHash, ...decision,
@@ -190,7 +207,7 @@ export function signAiApproval(receipt, key, description) {
   return { statement, signature: sign(null, signedBytes(statement), key).toString("base64url") };
 }
 
-function verifyDecision(proof, order, description) {
+function verifyDecision(proof, order, description, modelId, options) {
   assert(exact(proof, ["statement", "signature"]) && record(proof.statement),
     "AI_APPROVAL_PROOF_INVALID", "缺少完整的 AI 审核工位签章。");
   const s = proof.statement;
@@ -199,7 +216,7 @@ function verifyDecision(proof, order, description) {
     && s.evidenceHash === order.evidenceHash && Number.isFinite(Date.parse(s.reviewedAt))
     && verifySignature(publicKey(description), s, proof.signature), "AI_APPROVAL_PROOF_INVALID", "AI 签章与当前审核证据不匹配。");
   verdict({ decision: s.decision, rationale: s.rationale, findings: s.findings }, order);
-  validateProvider(s.modelReceipt);
+  validateProvider(s.modelReceipt, modelId, options);
   return s;
 }
 
@@ -254,7 +271,8 @@ function approved(receipt) {
   return receipt;
 }
 
-export function createAiApproval({ directory, origin, model, clock = () => new Date(), waitMs = 16000 } = {}) {
+export function createAiApproval({ directory, origin, model, modelId = codexTextRegistration().officialModelId,
+  clock = () => new Date(), waitMs = 16000 } = {}) {
   const inFlight = new Map();
   const seen = new Map();
   let ready;
@@ -284,13 +302,13 @@ export function createAiApproval({ directory, origin, model, clock = () => new D
   async function queueResult(order, description) {
     const id = order.evidenceHash;
     const completed = await readRecord(file(id, "result"), 32_768);
-    if (completed) return approved(verifyDecision(completed, order, description));
+    if (completed) return approved(verifyDecision(completed, order, description, modelId, { stored: true }));
     await writeOnce(file(id, "order"), { order, createdAt: clock().toISOString() });
     const until = Date.now() + waitMs;
     do {
       const result = await readRecord(file(id, "result"), 32_768);
       if (result) {
-        const receipt = verifyDecision(result, order, description);
+        const receipt = verifyDecision(result, order, description, modelId, { stored: true });
         await discardOrder(file(id, "order"));
         return approved(receipt);
       }
@@ -316,19 +334,22 @@ export function createAiApproval({ directory, origin, model, clock = () => new D
       const description = await workerKey();
       if (input.proof !== undefined) {
         assert(description, "AI_APPROVAL_WORKER_REQUIRED", "需先配置专用 AI 审核工位公钥。");
-        return approved(verifyDecision(input.proof, order, description));
+        return approved(verifyDecision(input.proof, order, description, modelId));
       }
       if (description) return queueResult(order, description);
       if (!model) fail(503, "AI_APPROVAL_WORKER_REQUIRED", "生产环境尚无已登记的 AI 审核工位。", { reviewId: order.evidenceHash });
       const reviewId = order.evidenceHash;
       const existing = await readRecord(file(reviewId, "local-result"), 32_768);
-      if (existing) return approved(existing);
+      if (existing) {
+        validateProvider(existing.modelReceipt, modelId, { stored: true });
+        return approved(existing);
+      }
       if (!inFlight.has(reviewId)) {
         inFlight.set(reviewId, (async () => {
           const started = await writeOnce(file(reviewId, "local-attempt"), { startedAt: clock().toISOString() });
           if (!started) fail(409, "AI_APPROVAL_REVIEW_UNRESOLVED", "原 AI 调用结果需先对账。", { reviewId });
           let receipt;
-          try { receipt = await judgeAiApproval(order, model, clock); }
+          try { receipt = await judgeAiApproval(order, model, clock, modelId); }
           catch (error) {
             if (KNOWN_REFUSALS.has(error?.code) && error.unknown !== true) {
               await writeOnce(file(reviewId, `local-refusal-${randomUUID()}`), { code: error.code, at: clock().toISOString() });
@@ -433,7 +454,7 @@ export function createAiApproval({ directory, origin, model, clock = () => new D
           const job = await readRecord(orderPath);
           if (job) {
             assert(job.order?.evidenceHash === reviewId, "AI_APPROVAL_WORKER_INPUT_INVALID", "审核工作单与租约不匹配。");
-            verifyDecision(body.proof, job.order, description);
+            verifyDecision(body.proof, job.order, description, modelId);
             await writeOnce(resultPath, body.proof);
           }
         }

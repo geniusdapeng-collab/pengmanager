@@ -1,0 +1,78 @@
+name: Codex Edition CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  public-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: |
+          manager=$(node -p "require('./package.json').packageManager")
+          npm install --global "$manager"
+          pnpm install --frozen-lockfile
+      - name: Run public application, contract and engine tests
+        run: |
+          pnpm check
+          pnpm test
+          pnpm test:engines
+          pnpm smoke
+          pnpm scan:secrets
+      - name: Verify embedded snapshot identity
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { verifyPinnedSnapshot } from './src/video-runtime/snapshot.mjs';
+          const rootDir = process.cwd();
+          const pin = JSON.parse(readFileSync('upstreams/workloom-video-edit.pin.json', 'utf8'));
+          console.log(verifyPinnedSnapshot({ rootDir, engineRoot: join(rootDir, pin.engineRoot),
+            commit: pin.commit, fileCount: pin.sourceFileCount, expectedSha256: pin.snapshotSha256,
+            distribution: pin.distribution }));
+          NODE
+
+  native-video-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install pinned native video dependencies
+        working-directory: engines/video-edit
+        run: |
+          manager=$(node -p "require('./package.json').packageManager")
+          npm install --global "$manager"
+          node scripts/ci/install-private-ui.mjs \
+            --repo . --store-dir "$RUNNER_TEMP/pengmanager-video-store" \
+            --staging-root "$RUNNER_TEMP" --archive "$RUNNER_TEMP/pengmanager-ui-original.tgz" \
+            --report "$RUNNER_TEMP/pengmanager-ui-bootstrap.json"
+      - name: Check native video routing, budget and production contracts
+        working-directory: engines/video-edit
+        run: |
+          pnpm --dir packages/industry-contract build
+          pnpm exec tsc --noEmit -p apps/server/tsconfig.json
+          pnpm exec vitest run --maxWorkers=1 --no-file-parallelism \
+            packages/video-studio/src/codex-video.test.ts \
+            packages/video-studio/src/video-text-client.test.ts \
+            packages/video-studio/src/creative-runtime.test.ts \
+            packages/video-studio/src/producer-gate.test.ts \
+            apps/server/src/video/creative-config.test.ts

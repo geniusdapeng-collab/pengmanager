@@ -1,7 +1,7 @@
 export const SYSTEM_IDENTITY = Object.freeze({
   id: "pengmanager-system",
-  nameZh: "鹏经理系统",
-  nameEn: "PengManager System",
+  nameZh: "鹏经理Codex版",
+  nameEn: "PengManager Codex Edition",
 });
 
 export const MAIN_PROFILE = Object.freeze({
@@ -26,8 +26,8 @@ export const MAIN_PROFILE = Object.freeze({
 });
 
 export const CURRENT_ALIASES = Object.freeze([
-  "李大鹏", "PengManager", "Dapeng Li", "鹏经理", "鹏经理系统", "PengManager System",
+  "李大鹏", "PengManager", "Dapeng Li", "鹏经理", SYSTEM_IDENTITY.nameZh, SYSTEM_IDENTITY.nameEn,
 ]);
 
 // Historical names remain recognition aliases, never current display names.
-export const LEGACY_ALIASES = Object.freeze(["鹏栈", "PengStack", "dapengstack"]);
+export const LEGACY_ALIASES = Object.freeze(["鹏经理系统", "PengManager System", "鹏栈", "PengStack", "dapengstack"]);

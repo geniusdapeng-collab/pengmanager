@@ -16,10 +16,10 @@ const engine = new PersonalGeoEngine({
 
 try {
   const run = await engine.runVisibility({
-    provider: "deepseek-search",
+    provider: "codex-search",
     limit: controlQueries.length,
     queryIds: controlQueries.map((query) => query.id),
-    platform: "deepseek",
+    platform: "codex",
   });
   const articles = engine.generateArticles({
     dataMode: "draft",
@@ -31,10 +31,10 @@ try {
     day: "2-digit",
   }).format(new Date());
   const evidenceDir = join(rootDir, "var", "geo-engine", "evidence");
-  const receiptDir = join(rootDir, "docs", "evidence");
+  const receiptDir = join(rootDir, "var", "receipts");
   await Promise.all([
     mkdir(evidenceDir, { recursive: true }),
-    mkdir(receiptDir, { recursive: true }),
+    mkdir(receiptDir, { recursive: true, mode: 0o700 }),
   ]);
   const fullPath = join(evidenceDir, `personal-geo-${run.runId}.json`);
   await writeFile(
@@ -80,11 +80,11 @@ try {
     },
     fullEvidence: relative(rootDir, fullPath),
   };
-  const receiptPath = join(receiptDir, `personal-geo-live-${date}.json`);
+  const receiptPath = join(receiptDir, `personal-geo-live-${date}-${run.runId}.json`);
   await writeFile(
     receiptPath,
     `${JSON.stringify(receipt, null, 2)}\n`,
-    "utf8",
+    { encoding: "utf8", mode: 0o600 },
   );
   console.log(JSON.stringify(receipt, null, 2));
   if (run.failed > 0) process.exitCode = 1;

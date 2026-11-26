@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createPengManagerAgent } from '../src/agent.mjs';
 import { MCP_INSTRUCTIONS } from '../src/ai-agent-guide.mjs';
+import { SYSTEM_IDENTITY } from '../src/domain/identity.mjs';
+import metadata from '../package.json' with { type: 'json' };
 
 const versions = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
 const agent = await createPengManagerAgent();
@@ -15,7 +17,7 @@ async function handle(request) {
     reply(id, {
       protocolVersion: versions.has(params?.protocolVersion) ? params.protocolVersion : '2025-11-25',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'pengmanager-system', version: '1.0.0' },
+      serverInfo: { name: SYSTEM_IDENTITY.id, title: SYSTEM_IDENTITY.nameZh, version: metadata.version },
       instructions: MCP_INSTRUCTIONS,
     });
     return;

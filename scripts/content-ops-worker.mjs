@@ -11,7 +11,7 @@ import { boundedResponseBytes, bytesHash, decodeJson, fail, identifier, integer,
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const COMMANDS = new Set(['bindings', 'doctor', 'grant-hash', 'pair', 'run', 'status']);
-const HELP = `Content preparation worker (outbound only)\n\nCommands:\n  bindings\n  doctor --config /absolute/private/worker.json\n  grant-hash --grant /absolute/private/local-grant.json\n  pair --config /absolute/private/worker.json --challenge-id ID --confirm-local-owner\n  run --config /absolute/private/worker.json [--watch] [--recover-stale-lock]\n  status --config /absolute/private/worker.json\n\nCredentials are process-only: CONTENT_OPS_WORKER_TOKEN, CONTENT_OPS_MODEL_API_KEY,\nCONTENT_OPS_PAIRING_CHALLENGE. No credential file discovery or publishing.\n`;
+const HELP = `Content preparation worker (outbound only)\n\nCommands:\n  bindings\n  doctor --config /absolute/private/worker.json\n  grant-hash --grant /absolute/private/local-grant.json\n  pair --config /absolute/private/worker.json --challenge-id ID --confirm-local-owner\n  run --config /absolute/private/worker.json [--watch] [--recover-stale-lock]\n  status --config /absolute/private/worker.json\n\nCredentials are process-only: CONTENT_OPS_WORKER_TOKEN, OPENAI_API_KEY,\nCONTENT_OPS_PAIRING_CHALLENGE. No credential file discovery or publishing.\n`;
 
 function readPrivateJson(file, label) {
   requireCondition(typeof file === 'string' && path.isAbsolute(file), 'WORKER_CONFIG_INVALID', `${label} needs an explicit absolute path.`);
@@ -113,7 +113,7 @@ async function main() {
   try {
     store = new WorkerLocalStore({ dataDir: config.dataDir, rootDir: ROOT });
     const adapters = await createContentOpsAdapters({ rootDir: ROOT, currency: config.currency,
-      modelConfig: { ...config.model, apiKey: process.env.CONTENT_OPS_MODEL_API_KEY, allowLoopbackHttp: config.allowLoopbackHttp === true },
+      modelConfig: config.model,
       rendererOptions: { ...config.renderer, workRoot: config.renderer?.workRoot ?? store.root },
       mediaOptions: { ...config.media, workRoot: config.media?.workRoot ?? store.root } });
     if (command === 'doctor') { console.log(JSON.stringify({ schema: WORKER_PROTOCOL, status: 'diagnosed', credentialsPrinted: false,

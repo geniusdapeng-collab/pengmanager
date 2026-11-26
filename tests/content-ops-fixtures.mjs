@@ -18,15 +18,24 @@ export const FIXTURE_PRICING = Object.freeze({ provider: "isolated_fixture", mod
 // These fixtures create real private state files, real full backups and the
 // actual additive migration. Model results remain explicitly isolated test
 // doubles. They neither contact a supplier nor establish a live price/output.
-export async function contentOpsFixture(t, { allDestinations = false } = {}) {
-  const f = await editorialFixture(t); let now = new Date(OPS_NOW);
+export async function contentOpsFixture(t, { allDestinations = false, modelRegistration } = {}) {
+  const f = await editorialFixture(t, { seedTransform(seed) {
+    if (seed.claims.some(row => row.id === "C003")) return;
+    seed.claims.push({ id: "C003", type: "project", text: "Synthetic fixture for the isolated content preparation pipeline.",
+      state: "draft", publicLevel: "private", sensitivity: "low", evidenceLevel: "A", expiresAt: null,
+      source: { visibility: "public", label: "Synthetic fixture", url: "https://nodejs.org/" } });
+  } }); let now = new Date(OPS_NOW);
   await readyWebsite(f); const { story, edition } = await createEditionVariant(f, { illustrated: false });
   const artifacts = new ProductionArtifacts({ store: f.store }); await artifacts.initialize();
   const backup = createEditorialBackup({ store: f.store, productionArtifacts: artifacts, clock: () => new Date(now) });
   await migrateContentOpsState(f.store, { clock: () => new Date(now), beforeMigration: () => backup.captureCurrent() });
   const bindings = await contentOpsAdapterBindings(), ops = new ContentOpsService({ store: f.store, artifactStore: artifacts, clock: () => new Date(now), adapterBindings: bindings });
   Object.assign(f, { ops, artifacts, bindings, backup, storyId: story.id, editionId: edition.id, clock: () => new Date(now), advance: milliseconds => { now = new Date(now.getTime() + milliseconds); } });
-  const budget = await ops.createBudget({ name: "Isolated no paid calls test budget", maxCalls: 500, maxInputTokens: 1_000_000, maxOutputTokens: 500_000, maxPerCallInputTokens: 131_072, maxPerCallOutputTokens: 500, maxInFlight: 2, currency: "USD", maxCostMicros: 2_000_000, deadlineAt: OPS_EXPIRY, maxRenderSeconds: 10_000, maxTempBytes: 1_000_000_000, maxNativeProcesses: 2, pricingSnapshot: FIXTURE_PRICING }, opsContext());
+  const pricingSnapshot = modelRegistration
+    ? { ...FIXTURE_PRICING, provider: modelRegistration.provider, model: modelRegistration.officialModelId } : FIXTURE_PRICING;
+  const budget = await ops.createBudget({ name: "Isolated no paid calls test budget", maxCalls: 500, maxInputTokens: 1_000_000, maxOutputTokens: 500_000, maxPerCallInputTokens: 131_072,
+    maxPerCallOutputTokens: modelRegistration?.maxOutputTokens ?? 500, maxInFlight: 2, currency: "USD", maxCostMicros: 2_000_000,
+    deadlineAt: OPS_EXPIRY, maxRenderSeconds: 10_000, maxTempBytes: 1_000_000_000, maxNativeProcesses: 2, pricingSnapshot }, opsContext());
   f.budget = budget;
   await ops.createAuthorContribution({ storyRef: contentOpsRef(f.store.snapshot().stories.find(row => row.id === story.id)), title: "真实隔离作者测试原稿", body: "我在这份隔离测试中亲自记录了实现、限制与核对过程。它是测试作者输入，不是线上客户经历。", locale: "zh-CN", sourceNote: "Human authored isolated test material; no business assertion.", authoredBy: "isolated fixture author" }, opsContext());
   f.destinationIds = { "official-site": "official-site" };

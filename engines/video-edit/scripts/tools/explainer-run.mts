@@ -30,6 +30,7 @@ import { engineStatus, jobsDirOf } from "../../apps/server/src/video/explainer/e
 import type { LlmCall } from "../../apps/server/src/video/explainer/semantics.js";
 import type { ExplainerShotbook } from "../../apps/server/src/video/explainer/types.js";
 import type { ShotPlan } from "../../apps/server/src/video/explainer/shotbook.js";
+import { CodexTextProvider, usesCodexText } from "../../packages/base/model-router/codex-provider.js";
 import { OpenAiCompatibleProvider } from "../../packages/base/model-router/providers.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -69,6 +70,8 @@ function llmFromEnv(): LlmCall | undefined {
    * （https://api.deepseek.com/anthropic），OpenAI 兼容调用要去掉这段后缀——
    * 否则 POST 到 /anthropic/chat/completions 会 404（真机踩过）。
    */
+  const codex = usesCodexText();
+  if (codex && (mode === "deepseek" || opt("llm-base"))) throw new Error("Codex 版口播任务必须使用宿主模型配置");
   const rawBase = opt("llm-base")
     ?? process.env.TALKCRAFT_LLM_BASE_URL
     ?? process.env.LLM_BASE_URL
@@ -77,12 +80,13 @@ function llmFromEnv(): LlmCall | undefined {
   const baseUrl = rawBase.trim().replace(/\/+$/, "").replace(/\/anthropic$/, "");
   const apiKey = process.env.DEEPSEEK_API_KEY ?? process.env.LLM_API_KEY ?? "";
   const model = opt("llm-model") ?? process.env.TALKCRAFT_LLM_MODEL ?? process.env.DEEPSEEK_MODEL ?? process.env.LLM_MODEL ?? "deepseek-flash";
-  if (!baseUrl || !apiKey) {
+  if (!codex && (!baseUrl || !apiKey)) {
     if (mode === "deepseek") throw new Error("--llm deepseek 要求 DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY（或 LLM_BASE_URL/LLM_API_KEY）");
     log("[cli] 未配置 LLM → 分镜走规则兜底（allowRuleShotbook=true）");
     return undefined;
   }
-  const provider = new OpenAiCompatibleProvider(model, { baseUrl, apiKey });
+  const provider = codex ? new CodexTextProvider({ model: opt("llm-model") })
+    : new OpenAiCompatibleProvider(model, { baseUrl, apiKey });
   return async (prompt: string, opts?: { system?: string }) => {
     const result = await provider.chat(
       [

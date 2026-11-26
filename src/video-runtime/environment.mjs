@@ -36,15 +36,22 @@ export function nativeEnvironment(config, privateState, urls, desktopKey, toolEn
       LLM_PROVIDER:textModel.provider,
       VOLCENGINE_ARK_API_KEY:String(config.env.VOLCENGINE_ARK_API_KEY||'').trim()||String(config.env.ARK_API_KEY||'').trim(),
     };
-    if(textModel.configured){
-      // Native onboarding and request verification read the canonical process variables.
-      base.LLM_BASE_URL=config.env.LLM_BASE_URL||config.env.DEEPSEEK_BASE_URL;
-      base.LLM_API_KEY=config.env.LLM_API_KEY||config.env.DEEPSEEK_API_KEY;
-      base.LLM_MODEL=textModel.model;
+    for (const key of Object.keys(base)) {
+      if (/^DEEPSEEK_/u.test(key)) delete base[key];
+    }
+    // The managed runtime uses only the root OpenAI Responses registration.
+    base.LLM_BASE_URL = textModel.baseUrl;
+    base.LLM_API_KEY = '';
+    base.LLM_MODEL = textModel.model ?? '';
+    delete base.LLM_FORCE_MODEL;
+    delete base.LLM_THINKING_TYPE;
+    for (const prefix of ['STORMAXE', 'SUPERMICKEY']) {
+      base[prefix + '_LLM_MODEL'] = base.LLM_MODEL;
+      base[prefix + '_LLM_FAST_MODEL'] = base.LLM_MODEL;
     }
     for(const [key,value]of Object.entries(toolEnvironment)){
       if(['WORKLOOM_UI_RELEASE_READ_TOKEN','CNB_UI_RELEASE_TOKEN'].includes(key))throw new VideoRuntimeError('TOOL_ENV_INVALID','Installation release credentials cannot be supplied to the native runtime.');
-      if(/^(DATABASE|JWT_|APP_DB_|GATEWAY_DB_|SERVER_|BUNDLES_ROOT$|HR_(?:WORK_DIR|CHARACTER_LIBRARY|PRODUCT_LIBRARY|PORTRAIT_REUSE_MANIFEST)$|WORKLOOM_(?:DESKTOP_|RENDER_|DELIVERY_|AUDIO_STEM_SIGNING_SECRET$|CLOUD_SYNC$|SCHEDULER_MS$|STARTUP_THREAD_RESUME$|ENV_PERSIST_MODE$|DECLARED_SKILLS_REQUIRED$|PRESERVE_SHADOWED_ROLES$)|MEDIA_SIGNING_SECRET$|PII_SALT$|ARCHIVE_AUTO_RESUME$|SKILL_DIST_|LLM_|DEEPSEEK_|VOLCENGINE_|ARK_|PIPELINE_|VM_CREATIVE_)/.test(key))throw new VideoRuntimeError('TOOL_ENV_INVALID','Tool setup attempted to replace native identity, database or authorization controls.');
+      if(/^(DATABASE|JWT_|APP_DB_|GATEWAY_DB_|SERVER_|BUNDLES_ROOT$|HR_(?:WORK_DIR|CHARACTER_LIBRARY|PRODUCT_LIBRARY|PORTRAIT_REUSE_MANIFEST)$|WORKLOOM_(?:DESKTOP_|RENDER_|DELIVERY_|AUDIO_STEM_SIGNING_SECRET$|CLOUD_SYNC$|SCHEDULER_MS$|STARTUP_THREAD_RESUME$|ENV_PERSIST_MODE$|DECLARED_SKILLS_REQUIRED$|PRESERVE_SHADOWED_ROLES$)|MEDIA_SIGNING_SECRET$|PII_SALT$|ARCHIVE_AUTO_RESUME$|SKILL_DIST_|(?:STORMAXE|SUPERMICKEY)_LLM_|PENGMANAGER_(?:ENGINE_ROOT$|CODEX_)|OPENAI_|LLM_|DEEPSEEK_|VOLCENGINE_|ARK_|PIPELINE_|VM_CREATIVE_)/.test(key))throw new VideoRuntimeError('TOOL_ENV_INVALID','Tool setup attempted to replace native identity, database or authorization controls.');
       if(typeof value!=='string')throw new VideoRuntimeError('TOOL_ENV_INVALID','Managed tool environment must contain strings only.');
       base[key]=value;
     }

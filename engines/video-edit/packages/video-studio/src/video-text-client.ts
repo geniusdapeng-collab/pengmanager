@@ -4,10 +4,14 @@ import https from "node:https";
 import { creativeBudgetActive, creativeExecutionSignal, guardedCreativeModelCall,
   modelResponseEvidence, modelTransportFailureClass, type CreativeModelOutcome } from "./creative-runtime.js";
 import {
+  CodexTextProvider,
+  CODEX_INPUT_TOKEN_BASIS,
+  usesCodexText,
   normalizeModelContent,
   planDeepSeekWindow,
   type ModelMessageContent,
 } from "@workloom/base/model-router";
+import { budgetCodexProvider } from "./codex-budget.js";
 import {
   DEEPSEEK_FLASH_CONTEXT_TOKENS,
   DEEPSEEK_FLASH_MODEL,
@@ -23,6 +27,7 @@ export interface VideoTextEndpoint {
   baseUrl: string;
   apiKey: string;
   model: string;
+  codexEnv?: NodeJS.ProcessEnv;
 }
 
 export interface VideoTextMessage {
@@ -149,7 +154,9 @@ export function videoTextEndpointFromEnv(
   const baseUrl = resolveOpenAiCompatibleBaseUrl(env);
   const apiKey = resolveVideoApiKey(env);
   const model = resolveVideoModel(env);
-  return baseUrl && apiKey && model ? { baseUrl, apiKey, model } : null;
+  if (!baseUrl || !apiKey || !model) return null;
+  // Keep OpenAI credentials in the process environment as the dispatcher input.
+  return usesCodexText(env) ? { baseUrl, apiKey: "", model, codexEnv: env } : { baseUrl, apiKey, model };
 }
 
 function failureDetail(value: unknown): string {
@@ -203,7 +210,7 @@ async function readBoundedBody(response: Response): Promise<Buffer> {
   }
 }
 
-export async function completeVideoTextTask(input: {
+interface VideoTextTask {
   endpoint: VideoTextEndpoint;
   scene: VideoScene;
   messages: VideoTextMessage[];
@@ -211,7 +218,58 @@ export async function completeVideoTextTask(input: {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   requireJson?: boolean;
-}): Promise<VideoTextResult> {
+}
+async function completeCodexVideoText(input: VideoTextTask): Promise<VideoTextResult> {
+  const policy = resolveVideoScene(input.scene, input.endpoint.codexEnv);
+  const executionSignal = creativeExecutionSignal();
+  const signal = input.signal && executionSignal
+    ? AbortSignal.any([input.signal, executionSignal]) : input.signal ?? executionSignal;
+  const provider = budgetCodexProvider(new CodexTextProvider({
+    model: input.endpoint.model,
+    env: input.endpoint.codexEnv,
+    fetchImpl: input.fetchImpl,
+  }));
+  const result = await provider.chat(input.messages, {
+    scene: input.scene, signal, timeoutMs: input.timeoutMs ?? 600_000,
+    responseFormat: { type: policy.responseFormat }, thinking: { ...policy.thinking },
+    reasoningEffort: policy.thinking.effort,
+  }).catch((error: unknown) => {
+    const failure = error as { code?: string; requestedModel?: string; requestHash?: string;
+      receipt?: { responseHash?: string; providerRequestId?: string; usage?: object } } | null;
+    const kind = failure?.code === "MODEL_CONTENT_EMPTY" ? "empty_json" : "invalid_json";
+    if (input.requireJson && ["MODEL_OUTPUT_SCHEMA_INVALID", "MODEL_CONTENT_EMPTY"].includes(failure?.code ?? "")
+      && failure?.requestedModel === input.endpoint.model && failure.requestHash
+      && failure.receipt?.usage && failure.receipt.responseHash && failure.receipt.providerRequestId) {
+      throw new VideoTextDispatchError(failure.code!, "模型最终 content 不是完整 JSON 对象。", {
+        unknown: false, jsonFailure: { kind, model: failure.requestedModel, requestHash: failure.requestHash,
+          responseHash: failure.receipt.responseHash, responseId: failure.receipt.providerRequestId },
+      });
+    }
+    throw error;
+  });
+  const identity = { model: result.modelId, responseId: result.responseId, requestHash: result.requestHash,
+    responseHash: result.responseHash };
+  let value: unknown;
+  if (input.requireJson) {
+    try { value = JSON.parse(result.text); }
+    catch {
+      throw new VideoTextDispatchError("MODEL_JSON_INVALID", "模型最终 content 不是完整 JSON。", {
+        unknown: false, jsonFailure: { ...identity, kind: "invalid_json" },
+      });
+    }
+  }
+  return {
+    text: result.text, value, ...identity, finishReason: "stop",
+    usage: { inputTokens: result.promptTokens, outputTokens: result.completionTokens, reasoningTokens: result.reasoningTokens },
+    outputCeiling: result.outputCeiling,
+    inputTokenEstimate: result.inputTokenEstimate,
+    inputTokenUpperBound: result.inputTokenUpperBound ?? result.inputTokenEstimate,
+    inputTokenBasis: CODEX_INPUT_TOKEN_BASIS, policyVersion: result.policyVersion,
+  };
+}
+
+export async function completeVideoTextTask(input: VideoTextTask): Promise<VideoTextResult> {
+  if (input.endpoint.codexEnv) return completeCodexVideoText(input);
   if (input.endpoint.model !== DEEPSEEK_FLASH_MODEL) {
     throw new VideoTextDispatchError(
       "VIDEO_TEXT_MODEL_NOT_REGISTERED",

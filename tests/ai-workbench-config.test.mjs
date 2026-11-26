@@ -33,6 +33,7 @@ test('config export produces canonical client settings and no state or credentia
   assert.equal(result.code, 0, result.stderr);
   const value = JSON.parse(result.stdout);
   assert.equal(value.schemaVersion, 'pengmanager.ai-workbench-config/v1');
+  assert.equal(value.productName, '鹏经理Codex版');
   assert.equal(value.rootDir, await realpath(root));
   assert.equal(value.dataDir, dataDir);
   assert.deepEqual(value.args, [path.join(root, 'scripts/agent-mcp.mjs')]);
@@ -52,6 +53,17 @@ test('config export produces canonical client settings and no state or credentia
   await assert.rejects(access(dataDir), { code: 'ENOENT' });
   await assert.rejects(access(path.join(directory, '.codex')), { code: 'ENOENT' });
   await assert.rejects(access(path.join(directory, '.qoder')), { code: 'ENOENT' });
+});
+
+test('config export passes an explicit loopback editorial address and omits API keys', async t => {
+  const { directory, dataDir } = await fixture(t);
+  const env = { PENGMANAGER_EDITORIAL_ORIGIN: 'http://127.0.0.1:4418/', OPENAI_API_KEY: 'fixture-never-export' };
+  const result = await configCli(['config', '--data-dir', dataDir], { cwd: directory, env });
+  assert.equal(result.code, 0, result.stderr);
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.env.PENGMANAGER_EDITORIAL_ORIGIN, 'http://127.0.0.1:4418');
+  assert.match(value.codexToml, /PENGMANAGER_EDITORIAL_ORIGIN = "http:\/\/127\.0\.0\.1:4418"/);
+  assert.ok(!result.stdout.includes('fixture-never-export'));
 });
 
 test('all client projections agree and configured env-file remains only an absolute path', async t => {

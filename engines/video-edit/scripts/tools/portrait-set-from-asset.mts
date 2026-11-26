@@ -33,6 +33,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assessLikenessBatch } from "../../packages/video-studio/src/likeness-policy.js";
+import { CodexTextProvider, usesCodexText } from "../../packages/base/model-router/codex-provider.js";
 import { OpenAiCompatibleProvider } from "../../packages/base/model-router/providers.js";
 
 function arg(name: string, fallback = ""): string {
@@ -231,6 +232,8 @@ const minLikeness = Number(arg("--min-likeness", "88"));
  * （`https://api.deepseek.com/anthropic`），拿它拼 `/chat/completions` 会 404 —— 真机踩过：
  * 校验全判"失败"，看起来像"生成的图不像"，其实是校验通道写错了。
  */
+const codexJudgeEnv = { ...env, ...process.env };
+const codexJudge = usesCodexText(codexJudgeEnv);
 const judgeKey = process.env.LLM_API_KEY || env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY || env.DEEPSEEK_API_KEY || "";
 const judgeBase = (process.env.LLM_BASE_URL || env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
 const judgeModel = process.env.LLM_MODEL || env.LLM_MODEL || process.env.DEEPSEEK_MODEL || env.DEEPSEEK_MODEL || "deepseek-flash";
@@ -246,17 +249,16 @@ if (verifyAgainst && !verifyAnchorDataUrl) {
   console.error(`--verify-against 不存在：${verifyAgainst}`);
   process.exit(2);
 }
-if (verifyAnchorDataUrl && !judgeKey) {
-  console.error("要做自动像不像校验，需要 DEEPSEEK_API_KEY（读 keys-file 或环境变量）");
+if (verifyAnchorDataUrl && !(codexJudge ? codexJudgeEnv.OPENAI_API_KEY : judgeKey)) {
+  console.error(codexJudge ? "要做自动像不像校验，需要当前 Codex 版的 OPENAI_API_KEY"
+    : "要做自动像不像校验，需要 DEEPSEEK_API_KEY（读 keys-file 或环境变量）");
   process.exit(2);
 }
 async function likenessCheck(png: Buffer, angle: string): Promise<{ ok: boolean; same: boolean; score: number | null; reason: string }> {
   if (!verifyAnchorDataUrl) return { ok: true, same: true, score: null, reason: "未启用自动校验（--verify-against 未提供）" };
   const imageDataUrl = `data:image/png;base64,${png.toString("base64")}`;
-  const provider = new OpenAiCompatibleProvider(judgeModel, {
-    baseUrl: judgeBase,
-    apiKey: judgeKey,
-  });
+  const provider = codexJudge ? new CodexTextProvider({ model: codexJudgeEnv.LLM_MODEL, env: codexJudgeEnv })
+    : new OpenAiCompatibleProvider(judgeModel, { baseUrl: judgeBase, apiKey: judgeKey });
   const result = await provider.chat([{
         role: "user",
         content: [

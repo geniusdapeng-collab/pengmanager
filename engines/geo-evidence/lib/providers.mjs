@@ -1,35 +1,7 @@
 import { readFile } from "node:fs/promises";
-import { createModelDispatcher } from "../../../src/model-routing/dispatcher.mjs";
-import { cleanBaseUrl, normalizeTextModelId } from "../../../src/model-routing/registry.mjs";
+import { CodexModelDispatcher, codexTextRegistration } from "../../../src/model-routing/codex.mjs";
 
-function deepseekConfig(overrides = {}) {
-  const rawBase = overrides.baseUrl
-    ?? process.env.DEEPSEEK_BASE_URL
-    ?? process.env.LLM_BASE_URL
-    ?? "https://api.deepseek.com";
-  const baseUrl = cleanBaseUrl(rawBase);
-  return {
-    apiKey: overrides.apiKey ?? process.env.DEEPSEEK_API_KEY ?? process.env.LLM_API_KEY ?? "",
-    baseUrl,
-    model: normalizeTextModelId(overrides.model ?? process.env.DEEPSEEK_MODEL ?? process.env.LLM_MODEL),
-    timeoutMs: Number(overrides.timeoutMs ?? process.env.DEEPSEEK_TIMEOUT_MS ?? 60_000),
-  };
-}
-
-function ensureKey(config) {
-  if (!config.apiKey.trim()) {
-    throw new Error("缺少 DEEPSEEK_API_KEY。真实采集必须显式配置凭据；fixture 模式无需凭据。");
-  }
-}
-
-function endpoint(baseUrl, path) {
-  const base = new URL(`${baseUrl.replace(/\/+$/, "")}/`);
-  let relative = path.replace(/^\/+/, "");
-  if (base.pathname.replace(/\/+$/, "").endsWith("/v1") && relative.startsWith("v1/")) {
-    relative = relative.slice(3);
-  }
-  return new URL(relative, base).toString();
-}
+export const isCodexProvider = name => name === "codex" || name === "codex-search";
 
 function fixtureAnswer(query) {
   const mention =
@@ -58,60 +30,15 @@ function fixtureAnswer(query) {
   };
 }
 
-function normalizeSearchResults(body) {
-  const candidates = [
-    body?.results,
-    body?.data?.results,
-    body?.web?.results,
-    body?.data,
-  ];
-  const results = candidates.find(Array.isArray) ?? [];
-  return results.map((item) => {
-    let url;
-    try {
-      url = new URL(String(item.url ?? item.link ?? ""));
-      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
-        return null;
-      }
-    } catch {
-      return null;
-    }
-    return {
-      title: String(item.title ?? item.name ?? ""),
-      url: url.toString(),
-      content: String(item.content ?? item.snippet ?? item.summary ?? ""),
-    };
-  }).filter(Boolean);
-}
-
-async function requestJson(url, init, timeoutMs, fetchImpl = fetch) {
-  const response = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
-  const text = await response.text();
-  let body = null;
-  try {
-    body = text ? JSON.parse(text) : null;
-  } catch {
-    body = { rawText: text.slice(0, 2000) };
-  }
-  if (!response.ok) {
-    const message = body?.error?.message ?? body?.message ?? body?.rawText ?? `HTTP ${response.status}`;
-    throw new Error(`DeepSeek 请求失败 ${response.status}: ${String(message).slice(0, 500)}`);
-  }
-  return body;
-}
-
-function chatPrompt(query) {
-  return `你是一个独立的消费者问题回答助手，不是品牌方。请直接回答用户问题，使用自然中文。不得编造品牌、型号、参数、价格、认证、客户案例或引用。无法确认时明确说明。若提供了搜索结果，只能使用结果中可核验的事实，并在末尾用 Markdown 链接列出实际使用来源。\n\n用户问题：${query.text}`;
-}
-
-export function getProviderCapabilities() {
-  const config = deepseekConfig();
+export function getProviderCapabilities(env = process.env) {
+  const config = codexTextRegistration({ env });
+  const configured = Boolean(env.OPENAI_API_KEY?.trim());
   return {
     fixture: true,
-    deepseek: Boolean(config.apiKey),
-    "deepseek-search": Boolean(config.apiKey),
-    model: config.model,
-    baseUrl: config.baseUrl,
+    codex: configured,
+    "codex-search": configured,
+    model: config.officialModelId,
+    protocol: config.protocol,
   };
 }
 
@@ -161,69 +88,54 @@ export function createProvider(name = "fixture", options = {}) {
     };
   }
 
-  if (name === "deepseek" || name === "deepseek-search") {
-    const config = deepseekConfig(options);
-    ensureKey(config);
-    const dispatcher = createModelDispatcher({
-      apiKey: config.apiKey,
-      baseUrl: config.baseUrl,
-      model: config.model,
-      timeoutMs: config.timeoutMs,
-      fetchImpl: options.fetchImpl ?? fetch,
-      maxRetries: 1,
-    });
+  if (isCodexProvider(name)) {
+    const env = options.env ?? process.env;
+    if (!env.OPENAI_API_KEY?.trim()) throw new Error("Codex GEO 真实采集需要在当前进程中配置 OPENAI_API_KEY。");
+    const config = codexTextRegistration({ env });
+    const dispatcher = new CodexModelDispatcher({ env, fetchImpl: options.fetchImpl });
+    const webSearch = name === "codex-search";
+    if ((options.platform && options.platform !== "codex")
+      || (options.model && options.model !== config.officialModelId) || options.baseUrl) {
+      throw new Error("Codex 观测固定使用当前版本登记的模型、平台名称和 OpenAI Responses 端点。");
+    }
     return {
       name,
-      platform: options.platform ?? "deepseek",
+      platform: "codex",
       dataMode: "real",
-      model: config.model,
+      model: config.officialModelId,
       async answer(query) {
-        let searchResults = [];
-        let searchRaw = null;
-        if (name === "deepseek-search") {
-          const searchBody = await requestJson(endpoint(config.baseUrl, "v1/tools/search"), {
-            method: "POST",
-            headers: {
-              authorization: `Bearer ${config.apiKey}`,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({ query: query.text, count: 5, need_content: true }),
-          }, config.timeoutMs, options.fetchImpl ?? fetch);
-          searchRaw = searchBody;
-          searchResults = normalizeSearchResults(searchBody);
-        }
-
-        const context = searchResults.length
-          ? `\n\n搜索结果：\n${searchResults.map((item, index) =>
-              `${index + 1}. ${item.title}\nURL: ${item.url}\n摘要: ${item.content.slice(0, 1800)}`).join("\n\n")}`
-          : "";
-        const prompt = `${chatPrompt(query)}${context}`;
+        const prompt = query.text;
         const completion = await dispatcher.completeTask({
           scene: "geo.visibility.answer",
+          webSearch,
           messages: [
             {
               role: "system",
-              content: "你是独立消费者问题回答助手。事实不清楚时必须说明，不得编造。最终答案直接输出给用户。",
+              content: "以独立消费者问题回答助手的身份直接用自然中文回答。不得编造品牌、型号、参数、价格、认证、客户案例或引用。无法确认时明确说明。"
+                + (webSearch ? "先使用 web search，按实际使用的来源标注事实。" : ""),
             },
             { role: "user", content: prompt },
           ],
         });
-        const answer = completion.text.trim();
-        if (!answer) throw new Error("DeepSeek 返回空答案。");
+        if (webSearch && !completion.foundWebSearch) throw new Error("供应商响应缺少实际搜索回执。");
+        const citations = webSearch
+          ? completion.citations.map(({ title, url }) => ({ title, url, kind: "provider-search" }))
+          : [];
         return {
-          answer,
+          answer: completion.text,
           prompt,
           raw: {
-            completion: completion.raw,
-            search: searchRaw,
-            searchResults,
+            modelReceipt: completion.receipt,
+            foundWebSearch: completion.foundWebSearch === true,
+            sources: completion.sources,
+            citations,
           },
           model: completion.model,
           usage: completion.usage,
           requestHash: completion.requestHash,
           responseHash: completion.responseHash,
           policy: completion.receipt.policy,
-          citations: searchResults.map(({ title, url }) => ({ title, url, kind: "provider-search" })),
+          citations,
         };
       },
     };

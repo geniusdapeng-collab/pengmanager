@@ -1,4 +1,5 @@
 import { hashObject } from "../domain/hash.mjs";
+import { SYSTEM_IDENTITY } from "../domain/identity.mjs";
 
 async function githubRequest(fetchImpl, token, path, options = {}) {
   const response = await fetchImpl(`https://api.github.com${path}`, {
@@ -83,7 +84,7 @@ export class GitHubAdapter {
     }
   }
 
-  async ensureLabel(name, color = "2563eb", description = "PengManager System GEO operation") {
+  async ensureLabel(name, color = "2563eb", description = `${SYSTEM_IDENTITY.nameEn} GEO operation`) {
     try {
       return await githubRequest(
         this.fetchImpl,
@@ -108,7 +109,7 @@ export class GitHubAdapter {
     await this.ensureLabel(
       label,
       "2563eb",
-      "A content publication created by the PengManager System live API adapter",
+      `A content publication created by the ${SYSTEM_IDENTITY.nameEn} live API adapter`,
     );
     const issue = await githubRequest(
       this.fetchImpl,

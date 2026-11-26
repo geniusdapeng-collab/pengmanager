@@ -6,6 +6,7 @@ import os from 'node:os';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { SingleRequestModel } from '../src/content-ops-worker/model.mjs';
+import { codexTextRegistration } from '../src/model-routing/codex.mjs';
 import { ContentOpsWorker, localGrantHash } from '../src/content-ops-worker/worker.mjs';
 import { WorkerLocalStore, LocalSourceRegistry } from '../src/content-ops-worker/local-store.mjs';
 import { WorkerHttpTransport } from '../src/content-ops-worker/transport.mjs';
@@ -40,27 +41,75 @@ test('single-request model requires verified token/pricing bounds before any pro
   assert.equal(new SingleRequestModel(modelConfig({ endpoint: 'http://supplier.invalid/chat' })).readiness().ready, false);
 });
 
-test('canonical content worker pins the documented DeepSeek window and official proof host', () => {
+function codexWorkerConfig(extra = {}) {
+  const env = { OPENAI_API_KEY: 'local-openai-fixture-key' };
+  const registration = codexTextRegistration({ env });
   const canonical = {
     ...modelConfig(),
-    provider: 'deepseek',
-    model: 'deepseek-flash',
-    contextTokenLimit: 1_048_576,
-    maxOutputTokens: 393_216,
+    env,
+    apiKey: undefined,
+    endpoint: undefined,
+    provider: registration.provider,
+    model: registration.officialModelId,
+    contextTokenLimit: registration.contextTokens,
+    maxOutputTokens: registration.maxOutputTokens,
     contextProof: {
       kind: 'provider_documented_context',
-      sourceUrl: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing/',
+      sourceUrl: 'https://developers.openai.com/api/docs/models/gpt-6.2-sol',
       sha256: HASH,
       verifiedAt: new Date(TIME).toISOString(),
     },
     allowUnregisteredModel: false,
   };
+  return { ...canonical, ...extra };
+}
+
+test('Codex worker pins the documented OpenAI window, model and official proof host', () => {
+  const canonical = codexWorkerConfig();
   assert.equal(new SingleRequestModel(canonical).readiness().ready, true);
   assert.equal(new SingleRequestModel({ ...canonical, contextTokenLimit: 8192 }).readiness().ready, false);
   assert.equal(new SingleRequestModel({ ...canonical, maxOutputTokens: 16_384 }).readiness().ready, false);
   assert.equal(new SingleRequestModel({ ...canonical, contextProof: {
     ...canonical.contextProof, sourceUrl: 'https://example.com/docs',
   } }).readiness().ready, false);
+  assert.equal(new SingleRequestModel({ ...canonical, model: 'deepseek-flash' }).readiness().reason, 'MODEL_ID_NOT_ALLOWED');
+  assert.equal(new SingleRequestModel({ ...canonical, endpoint: 'https://supplier.invalid/responses' }).readiness().reason, 'MODEL_ENDPOINT_INVALID');
+});
+
+test('Codex worker counts the exact frozen input and makes one post-reservation Responses generation', async () => {
+  const requests = [];
+  const config = codexWorkerConfig({ fetchImpl: async (url, init) => {
+    requests.push({ url: String(url), body: JSON.parse(init.body) });
+    assert.equal(init.redirect, 'error');
+    if (String(url).endsWith('/input_tokens')) {
+      return Response.json({ object: 'response.input_tokens', input_tokens: 65 });
+    }
+    return Response.json({ id: 'resp_worker_fixture', model: config.model, status: 'completed',
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [
+        { type: 'output_text', text: JSON.stringify(textResult) },
+      ] }],
+      usage: { input_tokens: 65, output_tokens: 30, total_tokens: 95 },
+    });
+  } });
+  const worker = new SingleRequestModel(config);
+  const input = { claims: [{ id: 'C1' }], source: '包含所有限制的原稿。', budget: { pricingSnapshotHash: OTHER, currency: 'USD' } };
+  await assert.rejects(worker.prepare('text.adapt', { ...input, budget: { pricingSnapshotHash: HASH, currency: 'USD' } }),
+    { code: 'MODEL_PRICING_REQUIRED' });
+  assert.equal(requests.length, 0);
+  const request = await worker.prepare('text.adapt', input);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(request.upperBound, { inputTokens: 65, outputTokens: config.maxOutputTokens, renderSeconds: 0, tempBytes: 1_000_000, nativeProcesses: 0 });
+  const result = await request.execute();
+  assert.deepEqual(requests.map(row => row.url), ['https://api.openai.com/v1/responses/input_tokens', 'https://api.openai.com/v1/responses']);
+  assert.deepEqual(requests[1].body.input, requests[0].body.input);
+  assert.match(requests[1].body.input.at(-1).content, /包含所有限制的原稿。/u);
+  assert.equal(requests[1].body.max_output_tokens, request.upperBound.outputTokens);
+  assert.equal(requests[1].body.tools, undefined);
+  assert.equal(result.providerRequestId, 'resp_worker_fixture');
+  assert.equal(result.usage.inputTokens, 65);
+  assert.equal(result.usageReceipt.pricingSnapshotHash, OTHER);
+  assert.equal(result.evidence.inputTokenBasis, 'openai-responses-input-tokens');
+  await assert.rejects(request.execute(), { code: 'DISPATCH_REPLAY_BLOCKED' });
 });
 
 test('actual loopback HTTP performs one JSON POST with full prompt and an entire documented context reserve', async t => {

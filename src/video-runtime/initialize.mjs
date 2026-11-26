@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { SCOPE, inside, atomicJson, VideoRuntimeError } from './config.mjs';
+import { SYSTEM_IDENTITY } from '../domain/identity.mjs';
 
 export async function initializeWorkspace({ engineRoot, dataRoot, sourceMain, env = process.env }) {
   const engine = fs.realpathSync(engineRoot), privateRoot = fs.realpathSync(dataRoot);
@@ -56,7 +57,7 @@ export async function initializeWorkspace({ engineRoot, dataRoot, sourceMain, en
       '付费生成、外发和声音克隆须按任务授权、预算与原生围栏执行；成功源片不得因美学评分自动重生成。',
       '客户数据与凭据不得外泄；覆盖层只能收紧既有权限和围栏。',
     ];
-    const archive = { brand: 'PengManager', enterprise: { name: '鹏经理系统', profile: '李大鹏的个人GEO、内容与视频生产系统。' }, property: { applicable: false, note: '保留完整组合档案契约；未经营酒店，不含酒店样本数据。' }, forbidden, fact_red_lines: forbidden, accounts: [], platforms: [], charter: { version: 2, mode: 'disabled' }, dataMode: 'real', dataBoundary: '真实本地系统元数据；尚无生产项目、外部发布或经营指标。' };
+    const archive = { brand: 'PengManager', enterprise: { name: SYSTEM_IDENTITY.nameZh, profile: '李大鹏的个人GEO、内容与视频生产系统。' }, property: { applicable: false, note: '保留完整组合档案契约；未经营酒店，不含酒店样本数据。' }, forbidden, fact_red_lines: forbidden, accounts: [], platforms: [], charter: { version: 2, mode: 'disabled' }, dataMode: 'real', dataBoundary: '真实本地系统元数据；尚无生产项目、外部发布或经营指标。' };
     const client = await owner.connect();
     let installedSkills = 0;
     const compositions = [];

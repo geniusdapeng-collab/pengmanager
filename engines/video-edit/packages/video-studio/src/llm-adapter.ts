@@ -14,6 +14,9 @@
  */
 import {
   canonicalDeepSeekModel,
+  CodexTextProvider,
+  requireCodexModel,
+  usesCodexText,
   OpenAiCompatibleProvider,
   routeSmart,
   type EventSink,
@@ -26,6 +29,7 @@ import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { productionModelInput } from "./prd-authority-bridge.js";
+import { budgetCodexProvider } from "./codex-budget.js";
 import { creativeBudgetActive, creativeBudgetedFetch, creativeExecutionSignal } from "./creative-runtime.js";
 import {
   resolveOpenAiCompatibleBaseUrl,
@@ -70,6 +74,7 @@ export interface WorkloomLLMEngineConfig {
   /** Default scene for bridged vendor calls. */
   scene?: string;
   fetchImpl?: typeof fetch;
+  codexEnv?: NodeJS.ProcessEnv;
   /**
    * v3.0 收口：注入路由配置后，全部 LLM 调用经 routeSmart
    * （场景 preproduction；opts.model===fastModel 的快速调用强制 L1 轻量档）——
@@ -92,7 +97,7 @@ export interface WorkloomLLMEngineConfig {
 }
 
 export class WorkloomLLMEngine {
-  private readonly cfg: Required<Omit<WorkloomLLMEngineConfig, "router">> & { router?: WorkloomLLMEngineConfig["router"] };
+  private readonly cfg: Required<Omit<WorkloomLLMEngineConfig, "router" | "codexEnv">> & Pick<WorkloomLLMEngineConfig, "router" | "codexEnv">;
   readonly stats = { totalCalls: 0, totalFailures: 0 };
 
   get model(): string {
@@ -101,6 +106,10 @@ export class WorkloomLLMEngine {
 
   get fastModel(): string {
     return this.cfg.fastModel;
+  }
+
+  vendorOptions(options: LLMReasonOptions): LLMReasonOptions {
+    return this.cfg.codexEnv ? { ...options, model: this.model } : options;
   }
 
   constructor(config: WorkloomLLMEngineConfig) {
@@ -112,7 +121,9 @@ export class WorkloomLLMEngine {
       fetchImpl: config.fetchImpl ?? fetch,
       ...config
     };
-    this.cfg.model = canonicalDeepSeekModel(this.cfg.model);
+    this.cfg.model = this.cfg.codexEnv
+      ? requireCodexModel(this.cfg.model, this.cfg.codexEnv)
+      : canonicalDeepSeekModel(this.cfg.model);
   }
 
   /** v3.0 收口：装配后注入路由配置（宿主侧 seam；vendor 无感） */
@@ -130,6 +141,7 @@ export class WorkloomLLMEngine {
       baseUrl,
       apiKey,
       model,
+      codexEnv: usesCodexText(env) ? env : undefined,
     });
   }
 
@@ -140,17 +152,21 @@ export class WorkloomLLMEngine {
   }
 
   private async requestChat(prompt: string, opts: LLMReasonOptions): Promise<LLMReasonResult> {
-    const activeModel = canonicalDeepSeekModel(opts.model ?? this.cfg.model);
+    const resolveModel = (model: string) => this.cfg.codexEnv
+      ? requireCodexModel(model, this.cfg.codexEnv) : canonicalDeepSeekModel(model);
+    const activeModel = resolveModel(opts.model ?? this.cfg.model);
     const scene = opts.scene
       ?? this.cfg.router?.scene
       ?? this.cfg.scene;
     const configuredProviders = this.cfg.router?.providers ?? new Map<string, ModelProvider>([[
       activeModel,
-      new OpenAiCompatibleProvider(activeModel, {
-        baseUrl: this.cfg.baseUrl,
-        apiKey: this.cfg.apiKey,
-        fetchImpl: this.cfg.fetchImpl,
-      }),
+      this.cfg.codexEnv
+        ? new CodexTextProvider({ model: activeModel, env: this.cfg.codexEnv, fetchImpl: this.cfg.fetchImpl })
+        : new OpenAiCompatibleProvider(activeModel, {
+            baseUrl: this.cfg.baseUrl,
+            apiKey: this.cfg.apiKey,
+            fetchImpl: this.cfg.fetchImpl,
+          }),
     ]]);
     const providers = new Map<string, ModelProvider>();
     for (const [key, provider] of configuredProviders) {
@@ -158,6 +174,10 @@ export class WorkloomLLMEngine {
         modelId: provider.modelId, healthy: () => provider.healthy(),
         chat: async (messages, callOptions = {}) => {
           if (!creativeBudgetActive()) return provider.chat(messages, callOptions);
+          const executionSignal = creativeExecutionSignal();
+          const signal = executionSignal && callOptions.signal
+            ? AbortSignal.any([executionSignal, callOptions.signal]) : executionSignal ?? callOptions.signal;
+          if (provider instanceof CodexTextProvider) return budgetCodexProvider(provider).chat(messages, { ...callOptions, signal });
           if (!(provider instanceof OpenAiCompatibleProvider)) throw new Error("CREATIVE_PROVIDER_UNSUPPORTED: exact request reservation requires the registered transport");
           // The pinned provider uses ordinary TS private fields. A per-call view
           // changes only its transport seam; shared provider identities stay intact.
@@ -165,9 +185,6 @@ export class WorkloomLLMEngine {
           if (!config || typeof config !== "object") throw new Error("CREATIVE_PROVIDER_UNSUPPORTED: provider transport identity changed");
           const view = Object.create(provider) as ModelProvider & { cfg: Record<string, unknown> };
           view.cfg = { ...config, fetchImpl: creativeBudgetedFetch(config.fetchImpl ?? fetch) };
-          const executionSignal = creativeExecutionSignal();
-          const signal = executionSignal && callOptions.signal
-            ? AbortSignal.any([executionSignal, callOptions.signal]) : executionSignal ?? callOptions.signal;
           return view.chat(messages, { ...callOptions, retries: 0, signal });
         },
       });
@@ -184,7 +201,7 @@ export class WorkloomLLMEngine {
           scene,
           plan: this.cfg.router?.plan,
           ...(this.cfg.router?.forceModel
-            ? { forceModel: canonicalDeepSeekModel(this.cfg.router.forceModel) }
+            ? { forceModel: resolveModel(this.cfg.router.forceModel) }
             : {}),
           timeoutMs: opts.timeoutMs ?? this.cfg.timeoutMs,
           signal: opts.signal,
@@ -467,17 +484,17 @@ export function installVendorEngineBridge(engine: WorkloomLLMEngine): () => void
       prototype[name] = impl;
     };
     redirect("reason", (prompt: unknown, options: unknown = {}) =>
-      engine.reason(String(prompt ?? ""), options as LLMReasonOptions));
+      engine.reason(String(prompt ?? ""), engine.vendorOptions(options as LLMReasonOptions)));
     redirect("reasonRaw", (prompt: unknown, options: unknown = {}) =>
-      engine.reasonRaw(String(prompt ?? ""), options as LLMReasonOptions));
+      engine.reasonRaw(String(prompt ?? ""), engine.vendorOptions(options as LLMReasonOptions)));
     redirect("reasonStructured", (prompt: unknown, schema: unknown, options: unknown = {}) =>
-      engine.reasonStructured(String(prompt ?? ""), schema, options as LLMReasonOptions));
+      engine.reasonStructured(String(prompt ?? ""), schema, engine.vendorOptions(options as LLMReasonOptions)));
     redirect("chat", (systemPrompt: unknown, userPrompt: unknown, temperature: unknown = 1) => {
       const parsedTemperature = Number(temperature);
       return engine.chat(String(systemPrompt ?? ""), String(userPrompt ?? ""), Number.isFinite(parsedTemperature) ? parsedTemperature : 1);
     });
     redirect("generate", (prompt: unknown, options: unknown = {}) =>
-      engine.generate(String(prompt ?? ""), options as LLMReasonOptions));
+      engine.generate(String(prompt ?? ""), engine.vendorOptions(options as LLMReasonOptions)));
     return () => {
       for (const [name, original] of patched) prototype[name] = original;
     };

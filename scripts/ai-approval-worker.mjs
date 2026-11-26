@@ -4,9 +4,8 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID } fr
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { DeepSeekAdapter } from "../src/adapters/deepseek.mjs";
-import { DEEPSEEK_OFFICIAL_BASE_URL } from "../src/model-routing/registry.mjs";
-import { resolveDeepSeekApiKey } from "../src/adapters/auth.mjs";
+import { CodexAdapter } from "../src/adapters/codex.mjs";
+import { codexTextRegistration } from "../src/model-routing/codex.mjs";
 import { aiApprovalKeyId, aiApprovalWorkerAuthorization, judgeAiApproval, signAiApproval } from "../src/services/ai-approval.mjs";
 import { requestAiApprovalWorker } from "../src/services/ai-approval-worker-client.mjs";
 
@@ -25,7 +24,7 @@ if (!["public-key", "doctor", "run", "once"].includes(command)) throw new Error(
 if (command !== "public-key" && !opts.has("--origin")) {
   throw new Error("请用 --origin 明确指定审核工位要访问的站点。");
 }
-const profile = resolve(opts.get("--profile") || join(homedir(), "Library", "Application Support", "PengManager", "ai-approval"));
+const profile = resolve(opts.get("--profile") || join(homedir(), "Library", "Application Support", "PengManager Codex", "ai-approval"));
 await mkdir(profile, { mode: 0o700, recursive: true });
 const stat = await lstat(profile);
 if (!stat.isDirectory() || stat.mode & 0o077 || (process.getuid && stat.uid !== process.getuid())) {
@@ -80,24 +79,14 @@ const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(endpoint.hostname)
 if ((endpoint.protocol !== "https:" && !(loopback && endpoint.protocol === "http:")) || endpoint.username || endpoint.password
     || endpoint.pathname !== "/" || endpoint.search || endpoint.hash) throw new Error("审核工位需要确切 HTTPS origin 或本机回环测试地址。");
 const origin = endpoint.origin;
-const apiKey = resolveDeepSeekApiKey();
-const baseUrl = process.env.LLM_BASE_URL || process.env.DEEPSEEK_BASE_URL || DEEPSEEK_OFFICIAL_BASE_URL;
-const model = new DeepSeekAdapter({ apiKey, maxRetries: 0, baseUrl });
-
-async function checkAccount() {
-  if (new URL(baseUrl).origin !== DEEPSEEK_OFFICIAL_BASE_URL) return { checked: false, available: null };
-  const response = await fetch(`${DEEPSEEK_OFFICIAL_BASE_URL}/user/balance`, {
-    headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(12_000), redirect: "error",
-  });
-  const balance = await response.json();
-  if (!response.ok || typeof balance.is_available !== "boolean") throw new Error("AI 审核模型的余额状态未能核实。");
-  return { checked: true, available: balance.is_available };
-}
+const modelId = codexTextRegistration().officialModelId;
+const model = new CodexAdapter();
+if (!process.env.OPENAI_API_KEY?.trim()) throw new Error("审核工位需要在当前进程中配置 OPENAI_API_KEY。");
 
 if (command === "doctor") {
-  const account = await checkAccount();
+  const account = await model.health();
   console.log(JSON.stringify({ ...account, reviewerKeyId: keyId, origin }));
-  process.exit(account.available === false ? 1 : 0);
+  process.exit(account.ok === true ? 0 : 1);
 }
 const stateFile = join(profile, "outbox.json");
 const persist = (state) => savePrivate(stateFile, JSON.stringify(state));
@@ -137,7 +126,7 @@ async function work() {
   const identity = { reviewId: job.reviewId, leaseId: job.leaseId };
   await persist({ origin, phase: "model", body: identity });
   let decision;
-  try { decision = await judgeAiApproval(job.order, model); }
+  try { decision = await judgeAiApproval(job.order, model, undefined, modelId); }
   catch (error) {
     const code = /^[A-Z0-9_]{1,80}$/u.test(error?.code ?? "") ? error.code : "AI_WORKER_REVIEW_FAILED";
     const entry = { origin, phase: "report", action: "failed", body: { ...identity, code } };

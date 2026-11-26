@@ -19,10 +19,14 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolveProducerLlm } from "./producer-gate.js";
 import {
+  CodexTextProvider,
   DEEPSEEK_IMAGE_LIMIT_BYTES,
   OpenAiCompatibleProvider,
   type ModelContentPart,
 } from "@workloom/base/model-router";
+
+import { budgetCodexProvider } from "./codex-budget.js";
+import { creativeExecutionSignal } from "./creative-runtime.js";
 
 export const PLAUSIBILITY_POLICY_VERSION = "workloom.plausibility-review/v1" as const;
 /** @deprecated Character budgets are not a model context unit. */
@@ -285,14 +289,17 @@ export async function reviewPlausibility(
     ...images,
   ];
   try {
-    const provider = new OpenAiCompatibleProvider(llm.model, {
-      baseUrl: llm.baseUrl,
-      apiKey: llm.apiKey,
-      fetchImpl: options.fetchImpl,
-    });
+    const provider = llm.codexEnv
+      ? budgetCodexProvider(new CodexTextProvider({ env: llm.codexEnv, model: llm.model, fetchImpl: options.fetchImpl }))
+      : new OpenAiCompatibleProvider(llm.model, {
+        baseUrl: llm.baseUrl,
+        apiKey: llm.apiKey,
+        fetchImpl: options.fetchImpl,
+      });
     const result = await provider.chat([{ role: "user", content }], {
       scene: "video.quality.plausibility-review",
       timeoutMs: 600_000,
+      signal: llm.codexEnv ? creativeExecutionSignal() : undefined,
       temperature: 0.1,
       retries: 1,
     });

@@ -1,8 +1,7 @@
 import { boundedResponseBytes, bytesHash, dataHash, decodeJson, fail, identifier, integer, instant,
   isRecord, jsonValue, record, requireCondition, sha256, text, throwIfAborted, ContentOpsWorkerError } from './protocol.mjs';
 import { createModelDispatcher } from '../model-routing/dispatcher.mjs';
-import { DEEPSEEK_FLASH_CONTEXT_TOKENS, DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS,
-  normalizeTextModelId } from '../model-routing/registry.mjs';
+import { CodexModelDispatcher, codexTextRegistration } from '../model-routing/codex.mjs';
 import { PRODUCT_NAMING_PROMPT } from '../domain/product-naming.mjs';
 
 const TASK_PROMPTS = Object.freeze({
@@ -101,14 +100,18 @@ function validateModelResult(kind, value, input) {
   return value;
 }
 
-/** Single dispatched POST, no model fallback, tool calls or credential-file lookup. */
+/** One budgeted generation using the approved model and a process-only credential. */
 export class SingleRequestModel {
   #apiKey;
+  #env;
   #dispatcher;
   constructor({ endpoint, apiKey, provider, model, contextTokenLimit, contextProof, pricingSnapshotHash,
     currency, maxOutputTokens, timeoutMs = 120_000, fetchImpl = globalThis.fetch, allowLoopbackHttp = false,
-    allowUnregisteredModel = false } = {}) {
-    this.fetchImpl = fetchImpl; this.#apiKey = apiKey; this.provider = provider; this.model = model;
+    allowUnregisteredModel = false, env = process.env } = {}) {
+    this.#env = env;
+    this.fetchImpl = fetchImpl; this.#apiKey = allowUnregisteredModel ? apiKey : env.OPENAI_API_KEY;
+    this.provider = provider ?? (allowUnregisteredModel ? undefined : 'openai');
+    this.model = model ?? (allowUnregisteredModel ? undefined : codexTextRegistration({ env }).officialModelId);
     this.contextTokenLimit = contextTokenLimit; this.contextProof = contextProof; this.pricingSnapshotHash = pricingSnapshotHash;
     this.currency = currency; this.maxOutputTokens = maxOutputTokens; this.timeoutMs = timeoutMs;
     this.allowLoopbackHttp = allowLoopbackHttp; this.endpoint = endpoint;
@@ -120,32 +123,29 @@ export class SingleRequestModel {
       requireCondition(this.contextProof, 'TOKEN_BOUND_REQUIRED', 'A verified model context bound is required.');
       requireCondition(this.pricingSnapshotHash, 'MODEL_PRICING_REQUIRED', 'An exact authorized model price snapshot is required.');
       identifier(this.provider, 'Provider'); text(this.model, 'Model', { max: 200 });
-      if (this.allowUnregisteredModel !== true) {
-        normalizeTextModelId(this.model);
-        requireCondition(this.provider === 'deepseek', 'TOKEN_BOUND_REQUIRED',
-          'The canonical text model must use the DeepSeek provider.');
-      }
       text(this.#apiKey, 'Provider credential', { max: 16_384 });
-      const endpoint = new URL(this.endpoint);
-      requireCondition(!endpoint.username && !endpoint.password && !endpoint.hash && !endpoint.search
-        && (endpoint.protocol === 'https:' || this.allowLoopbackHttp && endpoint.protocol === 'http:'
-          && ['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)), 'MODEL_ENDPOINT_INVALID', 'The local owner must configure an allowed model endpoint.');
       integer(this.contextTokenLimit, 'Verified context token limit', 1, 10_000_000);
-      if (this.allowUnregisteredModel !== true) {
-        requireCondition(this.contextTokenLimit === DEEPSEEK_FLASH_CONTEXT_TOKENS, 'TOKEN_BOUND_REQUIRED',
-          'The canonical DeepSeek context bound must be the documented 1,048,576 tokens.');
-      }
       record(this.contextProof, 'Verified token upper bound', ['kind', 'sourceUrl', 'sha256', 'verifiedAt']);
       requireCondition(this.contextProof.kind === 'provider_documented_context', 'TOKEN_BOUND_REQUIRED', 'A documented model context bound is required before dispatch.');
       const source = new URL(this.contextProof.sourceUrl); requireCondition(source.protocol === 'https:' && !source.username && !source.password,
         'TOKEN_BOUND_REQUIRED', 'The context bound needs its verified official source.');
       sha256(this.contextProof.sha256); instant(this.contextProof.verifiedAt, 'Context verification time');
-      if (this.allowUnregisteredModel !== true) {
-        requireCondition(['api.deepseek.com', 'api-docs.deepseek.com'].includes(source.hostname),
-          'TOKEN_BOUND_REQUIRED', 'The context proof must come from an official DeepSeek host.');
-        requireCondition(this.maxOutputTokens === undefined
-          || this.maxOutputTokens === DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS, 'TOKEN_BOUND_REQUIRED',
-        'The canonical DeepSeek output bound must be the documented 393,216 tokens.');
+      if (this.allowUnregisteredModel) {
+        const endpoint = new URL(this.endpoint);
+        requireCondition(!endpoint.username && !endpoint.password && !endpoint.hash && !endpoint.search
+          && (endpoint.protocol === 'https:' || this.allowLoopbackHttp && endpoint.protocol === 'http:'
+            && ['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)), 'MODEL_ENDPOINT_INVALID', 'The fixture needs an allowed model endpoint.');
+      } else {
+        const expected = codexTextRegistration({ env: this.#env });
+        requireCondition(this.provider === expected.provider && this.model === expected.officialModelId,
+          'MODEL_ID_NOT_ALLOWED', 'The worker must use the edition’s registered OpenAI model.');
+        requireCondition(this.endpoint === undefined || this.endpoint === 'https://api.openai.com/v1/responses',
+          'MODEL_ENDPOINT_INVALID', 'The worker must use the official OpenAI Responses endpoint.');
+        requireCondition(['platform.openai.com', 'developers.openai.com', 'learn.chatgpt.com', 'api.openai.com'].includes(source.hostname),
+          'TOKEN_BOUND_REQUIRED', 'The context proof must come from an official OpenAI documentation host.');
+        requireCondition(this.contextTokenLimit === expected.contextTokens
+          && (this.maxOutputTokens === undefined || this.maxOutputTokens === expected.maxOutputTokens),
+          'TOKEN_BOUND_REQUIRED', 'The approved bounds must match the exact registered OpenAI model.');
       }
       if (this.maxOutputTokens !== undefined) integer(this.maxOutputTokens, 'Output token limit', 1, this.contextTokenLimit);
       integer(this.timeoutMs, 'Model timeout', 100, 600_000); sha256(this.pricingSnapshotHash);
@@ -156,25 +156,31 @@ export class SingleRequestModel {
   }
   #dispatchClient() {
     if (!this.#dispatcher) {
-      this.#dispatcher = createModelDispatcher({
+      this.#dispatcher = this.allowUnregisteredModel ? createModelDispatcher({
         apiKey: this.#apiKey,
         model: this.model,
         contextTokens: this.contextTokenLimit,
-        maxOutputTokens: this.maxOutputTokens ?? Math.min(this.contextTokenLimit, DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS),
+        maxOutputTokens: this.maxOutputTokens ?? this.contextTokenLimit,
         timeoutMs: this.timeoutMs,
         chatEndpoint: this.endpoint,
         fetchImpl: this.fetchImpl,
         maxRetries: 0,
         allowUnregisteredModel: this.allowUnregisteredModel,
+      }) : new CodexModelDispatcher({
+        env: this.#env, fetchImpl: this.fetchImpl, timeoutMs: this.timeoutMs,
       });
     }
     return this.#dispatcher;
   }
 
-  async prepare(kind, input) {
+  async prepare(kind, input, { signal } = {}) {
     requireCondition(Object.hasOwn(TASK_PROMPTS, kind), 'ADAPTER_KIND_DENIED', 'This model task is not in the fixed allowlist.');
     const ready = this.readiness(); requireCondition(ready.ready, ready.reason, 'The single-request model adapter is not configured with a verified token and pricing bound.');
     record(input, 'Frozen model input'); jsonValue(input, { maxBytes: 500_000 });
+    if (!this.allowUnregisteredModel) {
+      requireCondition(input.budget?.pricingSnapshotHash === this.pricingSnapshotHash && input.budget.currency === this.currency,
+        'MODEL_PRICING_REQUIRED', 'The frozen task must bind the exact OpenAI pricing snapshot and currency before preflight.');
+    }
     if (CHECK_KINDS.has(kind)) sha256(input.packageHash);
     let policyInstruction = '';
     if (input.workerPolicy?.authorEditingOnly) {
@@ -194,6 +200,7 @@ export class SingleRequestModel {
       messages,
       responseFormat: { type: 'json_object' },
       maxOutputTokens: this.maxOutputTokens,
+      signal,
     });
     const upperBound = prepared.upperBound;
     const requestHash = dataHash({ kind, requestHash: prepared.requestHash,
@@ -247,7 +254,7 @@ export class SingleRequestModel {
             evidence: { kind, requestHash, responseHash: result.responseHash, wireSha256: result.wireSha256,
               checker: CHECK_KINDS.has(kind), mediaInspection: false, policy: result.receipt.policy,
               finishReason: result.finishReason, reasoningTokens: result.usage.reasoningTokens,
-              outputCeiling: result.outputCeiling, inputTokenEstimate: result.receipt.budget.inputTokenEstimate,
+              outputCeiling: result.outputCeiling, inputTokenEstimate: result.receipt.budget.inputTokenEstimate ?? null,
               inputTokenUpperBound: result.receipt.budget.inputTokens, inputTokenBasis: result.receipt.budget.inputTokenBasis,
               attempts: result.attempts ?? [] } };
         } catch (error) {

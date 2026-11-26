@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { editorialOrigin } from './agent-editorial.mjs';
 
 const portNames = { postgres: 'PG', backend: 'BACKEND', web: 'WEB', compositor: 'COMPOSITOR', color: 'COLOR', bgm: 'BGM',
   subtitle: 'SUBTITLE', post: 'POST', voice: 'VOICE', voiceEngine: 'VOICE_ENGINE', loommate: 'LOOMMATE' };
 
 /** Only public instance coordinates cross back into a host shell. */
 export function clientRuntimeEnvironment(config, { explicitPortsOnly = false } = {}) {
-  return { PENGMANAGER_VIDEO_DATA_DIR: config.dataRoot, ...Object.fromEntries(Object.entries(portNames)
+  const origin = editorialOrigin(config.env.PENGMANAGER_EDITORIAL_ORIGIN);
+  return { PENGMANAGER_VIDEO_DATA_DIR: config.dataRoot, ...(origin ? { PENGMANAGER_EDITORIAL_ORIGIN: origin } : {}), ...Object.fromEntries(Object.entries(portNames)
     .map(([service, key]) => ['PENGMANAGER_VIDEO_' + key + '_PORT', String(config.ports[service])])
     .filter(([key]) => !explicitPortsOnly || config.env[key] !== undefined)) };
 }

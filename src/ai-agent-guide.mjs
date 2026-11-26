@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { modelEnvironmentArgs } from './ai-workbench-paths.mjs';
+import { SYSTEM_IDENTITY } from './domain/identity.mjs';
 
 export const AGENT_GUIDE_ID = 'pengmanager.agent.guide';
-export const MCP_INSTRUCTIONS = '先调用 pengmanager_agent_guide 并完整读取返回的文档，再执行任务。用户只需对话：有 shell 的 Codex/Qoder 由 Agent 执行同一 checkout 与私有目录的标准 CLI；MCP 提供指南、发现、计划和登记工具，不提供完整生产执行器。制作先用 pengmanager_video_workflow 保留原话与秒数，再用 pengmanager_video_preflight。计划不是成片；生产沿用 owner 授权、预算与原任务回执，结果未知时先对账，不重派。运行标准 CLI 前，先核查没有活跃本地作业，再用 pengmanager_video_stop 停止本 MCP 拥有的工位并读回状态；活跃作业先沿原任务查询，不抢锁或停止其他进程。';
+export const MCP_INSTRUCTIONS = '先调用 pengmanager_agent_guide 并完整读取当前 checkout 的指南。图文先用 pengmanager_editorial_plan 保留原话和任务类型，经授权后在已配置的本机工作台登记。提交图文生产前核对原 job ID、当前 ETag、模型费用和素材授权。审核与发布沿用管理台。视频先用 pengmanager_video_workflow 保留原话与秒数，再用 pengmanager_video_preflight，制作使用同一 checkout 的标准 CLI。结果未知时先对账，禁止重派。运行标准视频 CLI 前先核查活跃任务，再停止仅由本 MCP 所拥有的空闲工位并回读状态。';
 
 export const agentGuideDescriptor = {
-  id: AGENT_GUIDE_ID, title: '读取鹏经理 AI Agent 完整接入指南',
+  id: AGENT_GUIDE_ID, title: `读取${SYSTEM_IDENTITY.nameZh}完整接入指南`,
   description: '首次接入、更新源码或开始任务时先调用。返回本 checkout 的完整指南、SHA-256、绝对 CLI 入口和 CLI/MCP 支持边界；只读，不读取密钥或私有授权，不启动服务。',
   operation: 'read', risk: 'low', dataMode: 'unverified',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -36,11 +37,13 @@ export function readAiAgentGuide({ rootDir, dataDir, nodePath = process.execPath
     }
   });
   return {
-    schemaVersion: 'pengmanager.ai-agent-guide/v1', productId: 'pengmanager-system',
+    schemaVersion: 'pengmanager.ai-agent-guide/v1', productId: SYSTEM_IDENTITY.id, productName: SYSTEM_IDENTITY.nameZh,
     rootDir: root, dataDir, documents: docs,
     support: { shellRequiredForProduction: true, pureMcpProductionSupported: false,
       mcp: ['guide', 'catalog', 'registered-capabilities', 'workflow-plan', 'preflight'],
-      standardCli: ['plan', 'start', 'status', 'resume', 'deliver'] },
+      editorial: { transport: 'owner-configured-loopback', discovery: ['pengmanager.editorial.plan', 'pengmanager.editorial.status'],
+        job: ['pengmanager.editorial.job.create', 'pengmanager.editorial.job.get', 'pengmanager.editorial.job.dispatch'] },
+      standardCli: ['plan', 'start', 'status', 'resume', 'deliver', 'content-ops-worker'] },
     cli: {
       agent: { command: nodePath, argsPrefix: [...nodeArgs, path.join(root, 'scripts/agent.mjs')], env: runtimeEnvironment, dataArgs: ['--data-dir', dataDir] },
       standardVideo: { command: nodePath, argsPrefix: [...nodeArgs, path.join(root, 'scripts/video-standard.mjs')], env: runtimeEnvironment, dataArgs: ['--data-dir', dataDir],

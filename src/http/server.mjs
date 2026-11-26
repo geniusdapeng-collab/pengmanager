@@ -645,9 +645,12 @@ export function createGeoOsServer({
           writeJson(response, 200, await livePipeline.generateContent(body));
           return;
         }
-        if (path === "/api/live/deepseek/collect") {
-          writeJson(response, 200, await livePipeline.collectDeepSeek(body));
+        if (path === "/api/live/codex/collect") {
+          writeJson(response, 200, await livePipeline.collectCodex(body));
           return;
+        }
+        if (path === "/api/live/deepseek/collect") {
+          throw new ApiError(410, "GEO_PROVIDER_RETIRED", "本版本使用 Codex 观测。请明确选择 /api/live/codex/collect。");
         }
         if (path === "/api/live/geoevidence/run") {
           writeJson(response, 200, await livePipeline.runGeoEvidence(body));

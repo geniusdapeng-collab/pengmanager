@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGeoOsServer } from "../src/http/server.mjs";
-import { TEXT_PRIMARY_MODEL } from "../src/model-routing/registry.mjs";
+import { codexTextRegistration } from "../src/model-routing/codex.mjs";
 import {
   aiApprovalKeyId, aiApprovalWorkOrder, aiApprovalWorkerAuthorization, createAiApproval,
   judgeAiApproval, signAiApproval, verifyAiApprovalWorkOrder,
@@ -29,14 +29,14 @@ function judge(status = "pass", received = []) {
   return {
     async completeTask(request) {
       received.push(request);
-      const model = TEXT_PRIMARY_MODEL.officialModelId;
+      const model = codexTextRegistration().officialModelId;
       return {
         value: {
           decision: { pass: "approve", unknown: "needs_evidence", fail: "reject" }[status],
           findings: [{ criterion: "accurate", status, reason: "独立核对附件事实" }],
           rationale: "判断已记录",
         },
-        receipt: { schemaVersion: "workloom.model-receipt/v1", policy: { scene: "approval.decision" },
+        receipt: { schemaVersion: "workloom.model-receipt/v1", policy: { scene: "approval.decision" }, registry: { provider: "openai" },
           requestedModel: model, returnedModel: model, finishReason: "stop", responseId: "real-contract-fixture",
           requestHash: snapshotHash, responseHash: snapshotHash, wireSha256: snapshotHash, policyHash: snapshotHash,
           usage: { inputTokens: 24, outputTokens: 13, totalTokens: 37 } },
@@ -71,6 +71,21 @@ test("a rejection and unknown evidence are independently persisted and never pas
   await assert.rejects(unknown.approval.review(input), error =>
     error.code === "AI_APPROVAL_NEEDS_EVIDENCE" && error.details.aiReview.decision === "needs_evidence");
   await assert.rejects(unknown.approval.review({ ...input, snapshotHash: "old" }), { code: "AI_APPROVAL_SUBJECT_INVALID" });
+});
+
+test("a historical signed DeepSeek receipt can be replayed only when it was already stored", async t => {
+  const { directory, approval } = await runtime(t);
+  const pair = generateKeyPairSync("ed25519");
+  const publicKey = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  await writeFile(join(directory, "reviewer-public-key.json"), JSON.stringify({ publicKey }), { mode: 0o600 });
+  const order = aiApprovalWorkOrder(input);
+  const previous = await judgeAiApproval(order, judge());
+  previous.modelReceipt = { ...previous.modelReceipt, requestedModel: "deepseek-flash",
+    returnedModel: "deepseek-flash", registry: { provider: "deepseek" } };
+  const proof = signAiApproval(previous, pair.privateKey, publicKey);
+  await assert.rejects(approval.review({ ...input, proof }), { code: "AI_APPROVAL_MODEL_RECEIPT_INVALID" });
+  await writeFile(join(directory, `${order.evidenceHash}.result.json`), JSON.stringify(proof), { mode: 0o600 });
+  assert.equal((await approval.review(input)).modelReceipt.returnedModel, "deepseek-flash");
 });
 
 test("actual PNG bytes enter the vision request and tampering breaks the bound order", async () => {

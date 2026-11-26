@@ -43,7 +43,7 @@ function usage() {
 
 Usage:
   node apps/geo-evidence-studio/cli.mjs init [--db PATH]
-  node apps/geo-evidence-studio/cli.mjs run [--provider fixture|deepseek|deepseek-search|manual-import]
+  node engines/geo-evidence/cli.mjs run [--provider fixture|codex|codex-search|manual-import]
       [--limit 20] [--category brand] [--query-id ID]... [--file answers.jsonl]
       [--concurrency 2] [--db PATH]
   node apps/geo-evidence-studio/cli.mjs articles [--topic selection-guide] [--force]
@@ -55,7 +55,7 @@ Usage:
   node apps/geo-evidence-studio/cli.mjs serve [--port 4317] [--host 127.0.0.1]
 
 Notes:
-  - Real DeepSeek calls require DEEPSEEK_API_KEY in the environment.
+  - Real Codex observations require OPENAI_API_KEY and --confirm.
   - Fixture results are explicitly labelled and never count as production evidence.
 `);
 }
@@ -97,6 +97,9 @@ if (command === "serve") {
         case: "future-frontdesk",
       });
     } else if (command === "run") {
+      if (["codex", "codex-search"].includes(args.provider) && args.confirm !== true) {
+        throw new Error("Codex 真实观测需要显式传入 --confirm。");
+      }
       const result = await service.runObservations({
         provider: args.provider ?? "fixture",
         limit: number(args.limit, 20),

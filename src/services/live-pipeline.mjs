@@ -1,11 +1,12 @@
 import { ApiError, PolicyError } from "../domain/errors.mjs";
 import { hashObject } from "../domain/hash.mjs";
+import { SYSTEM_IDENTITY } from "../domain/identity.mjs";
 import { validatePublication } from "../domain/policy.mjs";
 
 export class LivePipelineService {
   constructor({
     service,
-    deepSeek,
+    model,
     github,
     geoEvidence,
     geoEngine,
@@ -14,7 +15,7 @@ export class LivePipelineService {
     clock = () => new Date(),
   }) {
     this.service = service;
-    this.deepSeek = deepSeek;
+    this.model = model;
     this.github = github;
     this.geoEngine = geoEngine ?? geoEvidence;
     this.videoEdit = videoEdit;
@@ -26,7 +27,7 @@ export class LivePipelineService {
   async adapterHealth() {
     const entries = await Promise.all(
       Object.entries({
-        deepSeek: this.deepSeek,
+        textModel: this.model,
         github: this.github,
         geoEvidence: this.geoEngine,
         videoEdit: this.videoEdit,
@@ -54,7 +55,7 @@ export class LivePipelineService {
       throw new PolicyError("CLAIM_NOT_APPROVED", "模型只能使用已经批准的事实。");
     }
 
-    const generated = await this.deepSeek.generateContent({
+    const generated = await this.model.generateContent({
       brief,
       claims,
       platform,
@@ -66,10 +67,12 @@ export class LivePipelineService {
       contentType,
       claimIds,
       platforms: [platform],
-      owner: "PengManager + DeepSeek",
+      owner: SYSTEM_IDENTITY.nameEn,
       opinion: false,
     });
+    const provider = generated.provider ?? generated.receipt?.registry?.provider ?? null;
     const generationEvidence = {
+      provider,
       requestedModel: generated.receipt?.requestedModel ?? generated.requestedModel ?? generated.model,
       resolvedModel: generated.receipt?.resolvedModel ?? generated.resolvedModel ?? generated.model,
       mode: generated.mode ?? generated.receipt?.mode ?? null,
@@ -83,7 +86,7 @@ export class LivePipelineService {
     await this.service.store.mutate(
       {
         type: "content.model_receipt_recorded",
-        actor: "DeepSeek",
+        actor: SYSTEM_IDENTITY.nameEn,
         payload: {
           contentId: content.id,
           model: generated.model,
@@ -99,7 +102,6 @@ export class LivePipelineService {
       (next) => {
         const row = next.content.find((item) => item.id === content.id);
         row.generation = {
-          provider: "deepseek",
           model: generated.model,
           ...generationEvidence,
           responseId: generated.responseId,
@@ -134,12 +136,12 @@ export class LivePipelineService {
     };
   }
 
-  async collectDeepSeek({ queryIds, limit = 12 } = {}) {
+  async collectCodex({ queryIds, limit = 12 } = {}) {
     const run = await this.geoEngine.runVisibility({
-      provider: "deepseek-search",
+      provider: "codex-search",
       limit: Math.max(1, Math.min(Number(limit) || 12, 50)),
       queryIds,
-      platform: "deepseek",
+      platform: "codex",
     });
     if (run.successful + run.failed === 0) {
       throw new ApiError(400, "QUERY_REQUIRED", "没有可采集的查询。");
@@ -175,6 +177,7 @@ export class LivePipelineService {
             sampleId: sample.id,
             evidenceHash: sample.evidenceHash,
             evidenceUri: sample.screenshotUri,
+            model: sample.model,
             citations: sample.citations,
           },
         });
@@ -297,7 +300,7 @@ export class LivePipelineService {
 
       const issue = await this.github.createIssue({
         title: content.title,
-        body: `${content.body}\n\n---\n\n由鹏经理系统（PengManager System）通过 GitHub 官方 REST API 发布。模型：${content.generation?.model ?? "未记录"}；内容版本：v${content.version}。`,
+        body: `${content.body}\n\n---\n\n由${SYSTEM_IDENTITY.nameZh}（${SYSTEM_IDENTITY.nameEn}）通过 GitHub 官方 REST API 发布。模型：${content.generation?.model ?? "未记录"}；内容版本：v${content.version}。`,
         label,
       });
       const publication = await this.service.recordPublication({

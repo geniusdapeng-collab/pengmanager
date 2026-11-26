@@ -1,6 +1,7 @@
 import { hashObject } from "./hash.mjs";
 import { requirePublicUrl } from "./public-url.mjs";
 import { closed, integer, text, oneOf, list, sha, fail, without, record, validDate } from "./content-ops.mjs";
+import { codexLongContextBilling } from "../model-routing/codex-pricing.mjs";
 
 export const BUDGET_NUMBERS = ["maxCalls", "maxInputTokens", "maxOutputTokens", "maxPerCallInputTokens", "maxPerCallOutputTokens", "maxInFlight", "maxCostMicros", "maxRenderSeconds", "maxTempBytes", "maxNativeProcesses"];
 export function validatePricing(value, { now = new Date(), ai = false } = {}) {
@@ -31,7 +32,17 @@ export function normalizeBudget(input, { id, now, actor, pricing } = {}) {
   list(row.requiredConditions, "requiredConditions", 32).forEach(condition => text(condition, "condition", 240)); row.authorizationHash = hashObject(row); return row;
 }
 const safe = value => { if (value > BigInt(Number.MAX_SAFE_INTEGER)) fail(422, "PRICING_REQUIRED", "费用计算超出安全整数范围。"); return Number(value); };
-export function upperBoundCost(pricing, bound) { return safe((BigInt(bound.inputTokens) * BigInt(pricing.inputCostMicrosPerMillion) + 999999n) / 1000000n + (BigInt(bound.outputTokens) * BigInt(pricing.outputCostMicrosPerMillion) + 999999n) / 1000000n + BigInt(pricing.requestCostMicros)); }
+function tokenCostMicros(tokens, rate, multiplier = 1n, divisor = 1n) {
+  const denominator = 1_000_000n * divisor;
+  return (BigInt(tokens) * BigInt(rate) * multiplier + denominator - 1n) / denominator;
+}
+export function upperBoundCost(pricing, bound) {
+  const longContext = pricing.provider === "openai" && codexLongContextBilling(pricing.model, bound.inputTokens);
+  const inputCost = tokenCostMicros(bound.inputTokens, pricing.inputCostMicrosPerMillion, longContext ? 2n : 1n);
+  const outputCost = tokenCostMicros(bound.outputTokens, pricing.outputCostMicrosPerMillion,
+    longContext ? 3n : 1n, longContext ? 2n : 1n);
+  return safe(inputCost + outputCost + BigInt(pricing.requestCostMicros));
+}
 export function budgetTotals(state, authorizationId) {
   const rows = state.modelBudgetReservations.filter(row => row.budgetAuthorizationId === authorizationId);
   const totals = { calls: rows.filter(row => row.costClass === "model").length, inputTokens: 0, outputTokens: 0, costMicros: 0, renderSeconds: 0, tempBytes: 0, nativeProcesses: 0, inFlight: 0, used: { inputTokens: 0, outputTokens: 0, costMicros: 0 }, reserved: { inputTokens: 0, outputTokens: 0, costMicros: 0 }, unknown: { count: 0, inputTokens: 0, outputTokens: 0, costMicros: 0 } };

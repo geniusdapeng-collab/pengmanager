@@ -6,6 +6,7 @@
  * `deepseek-flash`, with scene policy controlling thinking, format and
  * evidence.
  */
+import { requireCodexModel, usesCodexText } from "./codex-provider.js";
 import { OFF_PEAK_RATE_RATIO, OFF_PEAK_WINDOW } from "@workloom/shared";
 import {
   canonicalDeepSeekModel,
@@ -98,7 +99,7 @@ export interface ModelTrace {
   scene?: string;
   bill_to?: "tenant" | "platform";
   mode?: "enabled" | "disabled";
-  effort?: "low" | "high" | "max";
+  effort?: ChatResult["effort"];
   finishReason?: string;
   requestHash?: string;
   responseHash?: string;
@@ -221,10 +222,13 @@ export interface RouteResult {
   providerResult?: ChatResult;
 }
 
-function canonicalProvider(providers: Map<string, ModelProvider>): ModelProvider {
-  const provider = providers.get(DEEPSEEK_FLASH_MODEL_ID);
-  if (!provider) throw new Error("TEXT_PRIMARY_PROVIDER_MISSING");
-  canonicalDeepSeekModel(provider.modelId);
+function activeModelId(model?: string): string {
+  return usesCodexText() ? requireCodexModel(model) : canonicalDeepSeekModel(model);
+}
+
+function canonicalProvider(providers: Map<string, ModelProvider>, modelId: string): ModelProvider {
+  const provider = providers.get(modelId);
+  if (!provider || provider.modelId !== modelId) throw new Error("TEXT_PRIMARY_PROVIDER_MISSING");
   return provider;
 }
 
@@ -306,8 +310,9 @@ export async function route(
   }
   const tier = classify(task);
   const window = currentWindow(now);
+  const modelId = activeModelId();
   try {
-    const provider = canonicalProvider(providers);
+    const provider = canonicalProvider(providers, modelId);
     const result = await provider.chat(task.messages, {
       scene: "generic",
       thinking: { type: "disabled" },
@@ -342,7 +347,7 @@ export async function route(
   } catch (error) {
     const failure = providerFailure(error);
     const degradation = {
-      from: DEEPSEEK_FLASH_MODEL_ID,
+      from: modelId,
       to: null,
       reason: failure.message,
     };
@@ -354,7 +359,7 @@ export async function route(
         kind: failure.kind === "unknown" ? "unknown" : failure.kind,
         reason: failure.message,
         retryable: failure.retryable,
-        attempted: [DEEPSEEK_FLASH_MODEL_ID],
+        attempted: [modelId],
       },
     };
   }
@@ -449,13 +454,14 @@ function cancelResult(
   scene: string,
   tier: Tier3,
   passthrough: boolean,
+  modelId: string,
   previous: Array<{ from: string; to: string | null; reason: string }> = [],
 ): SmartRouteResult {
   return {
     kind: "unavailable",
     degraded: [
       ...previous,
-      { from: DEEPSEEK_FLASH_MODEL_ID, to: null, reason: "模型调用已取消（调用方 abort）" },
+      { from: modelId, to: null, reason: "模型调用已取消（调用方 abort）" },
     ],
     tier,
     scene,
@@ -476,14 +482,14 @@ export async function routeSmart(
   const plan = task.plan ?? "standard";
   const sceneConfig = resolveScene(policy, scene);
   const scenePolicy = resolveTextScenePolicy(scene, sceneOverride(policy, scene));
-  if (task.forceModel) canonicalDeepSeekModel(task.forceModel);
+  const modelId = activeModelId(task.forceModel);
   const tier = task.forceTier ?? resolveTier(policy, scene, plan);
   const timeoutMs = task.timeoutMs && task.timeoutMs > 0
     ? task.timeoutMs
     : DEFAULT_SCENE_TIMEOUTS[scene] ?? DEFAULT_CALL_TIMEOUT_MS;
   const passthrough = resolveScene(policy, scene).fallback === "passthrough-disclose";
 
-  if (task.signal?.aborted) return cancelResult(task, scene, tier, passthrough);
+  if (task.signal?.aborted) return cancelResult(task, scene, tier, passthrough, modelId);
   const circuit = sceneCircuits.get(scene);
   if (circuit
     && circuit.failures >= CIRCUIT_FAILURE_THRESHOLD
@@ -498,7 +504,7 @@ export async function routeSmart(
         kind: "circuit",
         reason: "模型场景熔断冷却中",
         retryable: false,
-        attempted: [DEEPSEEK_FLASH_MODEL_ID],
+        attempted: [modelId],
       },
     };
   }
@@ -557,7 +563,7 @@ export async function routeSmart(
     return { kind: "circuit_broken", tier, scene };
   }
 
-  const provider = canonicalProvider(providers);
+  const provider = canonicalProvider(providers, modelId);
   const window = currentWindow(now);
   try {
     const result = await provider.chat(task.messages, {
@@ -621,10 +627,10 @@ export async function routeSmart(
       providerResult: result,
     };
   } catch (error) {
-    if (task.signal?.aborted) return cancelResult(task, scene, tier, passthrough);
+    if (task.signal?.aborted) return cancelResult(task, scene, tier, passthrough, modelId);
     const failure = providerFailure(error);
     await sink.recordDegradation({
-      from: DEEPSEEK_FLASH_MODEL_ID,
+      from: modelId,
       to: null,
       reason: failure.message,
       action: task.action,
@@ -637,7 +643,7 @@ export async function routeSmart(
     sceneCircuits.set(scene, state);
     return {
       kind: "unavailable",
-      degraded: [{ from: DEEPSEEK_FLASH_MODEL_ID, to: null, reason: failure.message }],
+      degraded: [{ from: modelId, to: null, reason: failure.message }],
       tier,
       scene,
       passthrough,
@@ -645,7 +651,7 @@ export async function routeSmart(
         kind: failure.kind,
         reason: failure.message,
         retryable: failure.retryable,
-        attempted: [DEEPSEEK_FLASH_MODEL_ID],
+        attempted: [modelId],
       },
     };
   }

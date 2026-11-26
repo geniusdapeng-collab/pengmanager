@@ -7,6 +7,8 @@ import { JsonStore } from "../src/storage/json-store.mjs";
 import { loadSeedState } from "../src/services/bootstrap.mjs";
 import { GeoOsService } from "../src/services/geo-os-service.mjs";
 import { LivePipelineService } from "../src/services/live-pipeline.mjs";
+import { createGeoOsServer } from "../src/http/server.mjs";
+import { codexTextRegistration } from "../src/model-routing/codex.mjs";
 
 const rootDir = resolve(import.meta.dirname, "..");
 const dataDir = join(rootDir, "data", "seed");
@@ -34,7 +36,9 @@ test("current-model content can pass the evidence state machine and receive a pl
     const store = new JsonStore({ filePath, clock: now });
     await store.open(() => loadSeedState(dataDir));
     const service = new GeoOsService({ store, clock: now });
-    const deepSeek = {
+    const claimId = store.snapshot().claims[0].id;
+    const accountId = store.snapshot().accounts.find((row) => row.platform === "GitHub").id;
+    const model = {
       async health() {
         return { ok: true };
       },
@@ -45,7 +49,8 @@ test("current-model content can pass the evidence state machine and receive a pl
           hook: "证据先于内容",
           cta: "查看项目",
           hashtags: ["#GEO"],
-          model: "deepseek-flash",
+          model: codexTextRegistration().officialModelId,
+          provider: "openai",
           responseId: "resp-test",
           usage: { total_tokens: 100 },
           responseHash: "a".repeat(64),
@@ -74,30 +79,32 @@ test("current-model content can pass the evidence state machine and receive a pl
     };
     const live = new LivePipelineService({
       service,
-      deepSeek,
+      model,
       github,
       geoEvidence: unused,
       videoEdit: unused,
       clock: now,
     });
 
-    await service.approveClaim("C003", {
+    await service.approveClaim(claimId, {
       approvedBy: "Dapeng Li",
       publicLevel: "private",
     });
     await store.mutate({ type: "account.activated", actor: "test" }, (state) => {
-      const account = state.accounts.find((item) => item.id === "github");
+      const account = state.accounts.find((item) => item.id === accountId);
       account.status = "active";
       account.policyStatus = "reviewed";
+      account.policyCheckedAt = now().toISOString();
       return account;
     });
 
     const generated = await live.generateContent({
       brief: "解释证据优先的 GEO",
-      claimIds: ["C003"],
+      claimIds: [claimId],
       platform: "GitHub",
     });
     const contentId = generated.content.id;
+    assert.equal(generated.content.generation.provider, "openai");
     for (const target of ["fact_check", "approved", "scheduled"]) {
       await service.transitionContent(contentId, {
         target,
@@ -105,7 +112,7 @@ test("current-model content can pass the evidence state machine and receive a pl
         approvedBy: "Dapeng Li",
       });
     }
-    const published = await live.publishContentToGitHub({ contentId });
+    const published = await live.publishContentToGitHub({ contentId, accountId });
     assert.equal(published.issue.number, 1);
     assert.equal(published.publication.dataMode, "real");
     assert.equal(
@@ -115,4 +122,26 @@ test("current-model content can pass the evidence state machine and receive a pl
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("Codex collection route requires confirmation and the old provider route cannot silently substitute results", async t => {
+  let collected = 0;
+  const server = createGeoOsServer({ service: {}, publicDir: join(rootDir, "public"), livePipeline: {
+    async collectCodex() { collected++; return { provider: "codex-search" }; },
+  } });
+  await new Promise((ready, failed) => {
+    server.once("error", failed);
+    server.listen(0, "127.0.0.1", ready);
+  });
+  t.after(() => new Promise(resolveClose => server.close(resolveClose)));
+  const run = (name, confirm) => fetch(`http://127.0.0.1:${server.address().port}/api/live/${name}/collect`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm }),
+  });
+  assert.equal((await run("codex", false)).status, 400);
+  assert.equal((await run("deepseek", true)).status, 410);
+  assert.equal(collected, 0);
+  const result = await run("codex", true);
+  assert.equal(result.status, 200);
+  assert.equal((await result.json()).provider, "codex-search");
+  assert.equal(collected, 1);
 });

@@ -252,15 +252,17 @@ test("GitHub adapter creates a label and a real issue receipt shape", async () =
 test("GeoEvidence adapter requires a synced upstream receipt", async () => {
   const adapter = new GeoEvidenceAdapter({
     baseUrl: "http://geo.test",
-    fetchImpl: async (url) => {
+    fetchImpl: async (url, init) => {
       if (String(url).endsWith("/api/health")) {
         return jsonResponse({ ok: true, service: "geo-evidence-studio" });
       }
+      assert.deepEqual(JSON.parse(init.body).params,
+        { provider: "codex-search", platform: "codex", limit: 1, queryId: "query-1", confirm: true });
       return jsonResponse({
         result: {
           runId: "run-1",
           status: "completed",
-          provider: "deepseek-search",
+          provider: "codex-search",
           dataMode: "real",
           successful: 1,
           failed: 0,
@@ -273,7 +275,6 @@ test("GeoEvidence adapter requires a synced upstream receipt", async () => {
   const health = await adapter.health();
   assert.equal(health.ok, true);
   const run = await adapter.runVisibility({
-    provider: "deepseek-search",
     limit: 1,
     queryId: "query-1",
   });

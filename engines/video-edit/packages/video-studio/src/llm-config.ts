@@ -6,6 +6,9 @@
  */
 import {
   canonicalDeepSeekModel,
+  codexVideoRegistration,
+  requireCodexModel,
+  usesCodexText,
   DEEPSEEK_FLASH_CONTEXT_TOKENS,
   DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS,
   DEEPSEEK_FLASH_MODEL_ID,
@@ -46,6 +49,7 @@ function isDeepSeekEndpoint(value: string): boolean {
 
 /** Canonical model used by every video-pipeline call. Explicit pins win. */
 export function resolveVideoModel(env: Env = process.env): string {
+  if (usesCodexText(env)) return requireCodexModel(env.LLM_MODEL, env);
   const configured = clean(env.LLM_FORCE_MODEL)
     || clean(env.LLM_MODEL)
     || clean(env.DEEPSEEK_MODEL);
@@ -62,11 +66,13 @@ export function resolveVideoModel(env: Env = process.env): string {
  * cannot serve `/chat/completions`, so normalize it without hiding the config.
  */
 export function resolveOpenAiCompatibleBaseUrl(env: Env = process.env): string {
+  if (usesCodexText(env)) return codexVideoRegistration(env).baseUrl;
   const base = clean(env.LLM_BASE_URL) || clean(env.DEEPSEEK_BASE_URL);
   return base.replace(/\/+$/, "").replace(/\/anthropic$/i, "");
 }
 
 export function resolveVideoApiKey(env: Env = process.env): string {
+  if (usesCodexText(env)) return clean(env.OPENAI_API_KEY);
   return clean(env.LLM_API_KEY) || clean(env.DEEPSEEK_API_KEY);
 }
 

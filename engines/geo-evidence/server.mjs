@@ -4,6 +4,7 @@ import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GeoStore, defaultDatabasePath } from "./lib/store.mjs";
 import { GeoEvidenceService } from "./lib/service.mjs";
+import { isCodexProvider } from "./lib/providers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const defaultRoot = resolve(here, "../..");
@@ -121,6 +122,9 @@ export function createGeoStudioServer(options = {}) {
       }
       if (request.method === "POST" && url.pathname === "/api/run") {
         const body = await readJson(request);
+        if (isCodexProvider(body.provider) && (!token || body.confirm !== true)) {
+          return sendJson(response, 403, { error: "Codex observation requires the owner token and confirm=true." });
+        }
         return sendJson(response, 200, await service.runObservations(body));
       }
       if (request.method === "POST" && url.pathname === "/api/articles/generate") {
@@ -137,6 +141,10 @@ export function createGeoStudioServer(options = {}) {
       }
       if (request.method === "POST" && url.pathname === "/api/tool") {
         const body = await readJson(request);
+        if (body.name === "visibility.collect" && isCodexProvider(body.params?.provider)
+          && (!token || body.params.confirm !== true)) {
+          return sendJson(response, 403, { error: "Codex observation requires the owner token and confirm=true." });
+        }
         return sendJson(response, 200, await service.handleTool(body.name, body.params, body.scope));
       }
 

@@ -9,6 +9,7 @@ import { ContentOpsWorker, localGrantHash } from '../src/content-ops-worker/work
 import { WorkerLocalStore } from '../src/content-ops-worker/local-store.mjs';
 import { createContentOpsAdapters } from '../src/content-ops-worker/adapters.mjs';
 import { SingleRequestModel } from '../src/content-ops-worker/model.mjs';
+import { codexTextRegistration } from '../src/model-routing/codex.mjs';
 import { bytesHash, dataHash } from '../src/content-ops-worker/protocol.mjs';
 import { validateCandidateForReview } from '../src/domain/content-ops-quality.mjs';
 import { qualityTextKeys } from '../src/domain/content-ops-coverage.mjs';
@@ -29,7 +30,7 @@ function supplierOutput(input, prompt) {
     disclosure: { aiUse: input.workerPolicy.authorEditingOnly ? 'copyedit' : 'generated_text' },
     ...(input.transformSpec ? { locale: input.transformSpec.targetLocale, format: input.transformSpec.targetFormat, sourceRefs: input.plan.motherEditionRefs } : {}) };
 }
-async function actualWorker(t, f, job, { checker = false, onProvider, tamperLease = false } = {}) {
+async function actualWorker(t, f, job, { checker = false, onProvider, tamperLease = false, modelRegistration } = {}) {
   const workerId = `actual-${checker ? 'checker' : 'writer'}-${randomBytes(4).toString('hex')}`;
   const pairing = await f.ops.createPairing({ workerId, origin: 'https://pengmanager.com', workspaceId: 'isolated-fixture',
     projectIds: ['isolated-fixture'], jobIds: [job.id], targetKeys: [], adapterIds: f.bindings.map(binding => binding.adapterId),
@@ -60,8 +61,8 @@ async function actualWorker(t, f, job, { checker = false, onProvider, tamperLeas
       } finally { await opened.handle.close(); }
     },
   };
-  const calls = [];
-  const model = new SingleRequestModel({ endpoint: 'https://isolated-fixture.invalid/chat', apiKey: 'nonsecret-isolated-fixture-key',
+  const calls = [], counted = [];
+  const fixtureModel = { endpoint: 'https://isolated-fixture.invalid/chat', apiKey: 'nonsecret-isolated-fixture-key',
     provider: FIXTURE_PRICING.provider, model: FIXTURE_PRICING.model, contextTokenLimit: 131_072,
     contextProof: { kind: 'provider_documented_context', sourceUrl: FIXTURE_PRICING.sourceUrl, sha256: dataHash({ fixtureOnly: true }), verifiedAt: f.clock().toISOString() },
     pricingSnapshotHash: f.budget.pricingSnapshotHash, currency: 'USD', maxOutputTokens: 200, allowUnregisteredModel: true,
@@ -71,7 +72,32 @@ async function actualWorker(t, f, job, { checker = false, onProvider, tamperLeas
       return new Response(JSON.stringify({ id: `isolated-${workerId}-${calls.length}`, model: FIXTURE_PRICING.model,
         choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(supplierOutput(input, request.messages[0].content)) } }],
         usage: { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 } }));
-    } });
+    } };
+  const model = new SingleRequestModel(modelRegistration ? {
+    env: { PENGMANAGER_CODEX_MODEL: modelRegistration.officialModelId, OPENAI_API_KEY: 'isolated-responses-key' },
+    contextTokenLimit: modelRegistration.contextTokens,
+    contextProof: { ...fixtureModel.contextProof, sourceUrl: 'https://developers.openai.com/api/docs/models' },
+    pricingSnapshotHash: f.budget.pricingSnapshotHash, currency: 'USD',
+    async fetchImpl(url, init) {
+      const request = JSON.parse(init.body);
+      if (String(url).endsWith('/input_tokens')) {
+        counted.push(request.input);
+        return Response.json({ object: 'response.input_tokens', input_tokens: 100 });
+      }
+      assert.equal(String(url), 'https://api.openai.com/v1/responses');
+      assert.equal(request.max_output_tokens, modelRegistration.maxOutputTokens);
+      assert.deepEqual(request.input, counted[calls.length]);
+      const input = JSON.parse(request.input.at(-1).content);
+      calls.push(input);
+      const reservations = f.ops.getJob(job.id, opsContext()).reservations;
+      assert.ok(reservations.some(row => row.model === modelRegistration.officialModelId && row.status === 'dispatch_recorded'));
+      const value = supplierOutput(input, request.input.find(row => row.role === 'system').content);
+      return Response.json({ id: `resp_${workerId}_${calls.length}`, model: modelRegistration.officialModelId, status: 'completed',
+        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: JSON.stringify(value) }] }],
+        usage: { input_tokens: 100, output_tokens: 100, total_tokens: 200 },
+      });
+    },
+  } : fixtureModel);
   const store = new WorkerLocalStore({ dataDir: path.join(f.directory, workerId), rootDir: path.resolve(import.meta.dirname, '..'), clock: () => f.clock().getTime() }).acquire();
   t.after(() => { if (fs.existsSync(store.root)) store.close(); });
   const adapters = await createContentOpsAdapters({ model, clock: () => f.clock().getTime(), rendererOptions: { workRoot: store.root }, mediaOptions: { workRoot: store.root } });
@@ -80,10 +106,14 @@ async function actualWorker(t, f, job, { checker = false, onProvider, tamperLeas
 }
 
 test('actual worker and backend process a real source-backed text DAG with independent identities and reserved unknown costs', async t => {
-  const f = await contentOpsFixture(t), sourceBytes = Buffer.from('# Actual isolated source\n\nThis complete source is included in the final independent checker input.\n');
+  const modelRegistration = codexTextRegistration({ env: {} });
+  const f = await contentOpsFixture(t, { modelRegistration });
+  const sourceBytes = Buffer.from('# Actual isolated source\n\nThis complete source is included in the final independent checker input.\n');
   const source = await uploadOpsSource(f, { role: 'transcript', mime: 'text/markdown', bytes: sourceBytes });
   const { job } = await createOpsJob(f, { sourceArtifactIds: [source.id] }), initial = f.ops.getJob(job.id, opsContext());
-  const beforeContent = structuredClone(f.store.snapshot().content), writer = await actualWorker(t, f, job), checker = await actualWorker(t, f, job, { checker: true });
+  const beforeContent = structuredClone(f.store.snapshot().content);
+  const writer = await actualWorker(t, f, job, { modelRegistration });
+  const checker = await actualWorker(t, f, job, { checker: true, modelRegistration });
   const runs = [];
   for (let index = 0; index < 12; index++) {
     const first = await writer.worker.runOnce(), second = await checker.worker.runOnce(); runs.push(first, second);
@@ -97,6 +127,7 @@ test('actual worker and backend process a real source-backed text DAG with indep
   const reviewed = validateCandidateForReview(f.store.snapshot(), finished.candidates[0].id, { now: f.clock() });
   assert.equal(reviewed.reports[0].status, 'passed'); assert.notEqual(reviewed.reports[0].execution.subject, `worker:${writer.worker.workerId}`);
   assert.equal(finished.reservations.length, 5); assert.ok(finished.reservations.every(row => row.status === 'partially_settled' && row.actual.costMicros === null));
+  assert.ok(finished.reservations.every(row => row.provider === 'openai' && row.model === modelRegistration.officialModelId));
   assert.equal(finished.budgetTotals.unknown.count, 5); assert.deepEqual(f.store.snapshot().content, beforeContent);
   assert.equal(finished.blueprintHash, initial.blueprintHash);
   assert.deepEqual(finished.tasks.map(row => [row.taskId, row.taskHash]), initial.tasks.map(row => [row.taskId, row.taskHash]));
