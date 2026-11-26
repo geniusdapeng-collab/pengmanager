@@ -6,7 +6,9 @@ export async function readNativeModelReadiness(query) {
   const video={configured:false,availableModels:0},image={configured:false,availableModels:0};
   if(textResult.status==='fulfilled'&&textResult.value?.llm&&typeof textResult.value.llm.real==='boolean'){
     const actual=textResult.value;text.configured=actual.llm.real===true&&typeof actual.llm.model==='string'&&actual.llm.model.trim().length>0;
-    text.currentProcessProbeVerified=text.configured&&Array.isArray(actual.activationGate?.checks)&&actual.activationGate.checks.some(check=>check?.key==='llm'&&check.ok===true);
+    text.currentProcessProbeVerified=text.configured&&(typeof actual.llm.currentProcessProbeVerified==='boolean'
+      ? actual.llm.currentProcessProbeVerified
+      : Array.isArray(actual.activationGate?.checks)&&actual.activationGate.checks.some(check=>check?.key==='llm'&&check.ok===true));
     if(!text.configured)missing.push('native-text-model-not-configured');
   }else missing.push('native-text-model-status-unavailable');
   if(mediaResult.status==='fulfilled'&&Array.isArray(mediaResult.value?.models)){

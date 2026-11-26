@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createVideoRuntime, VideoRuntimeError } from './index.mjs';
-import { runtimeConfig, requireEngineModule, verifiedPortraitReuseManifest, SCOPE } from './config.mjs';
+import { runtimeConfig, requireEngineModule, textModelReadiness, verifiedPortraitReuseManifest, SCOPE } from './config.mjs';
 import { localJson, wait } from './process.mjs';
 import { advanceVideoMakeDelivery, approvedVideoMakeAuthority, createNativeVideoMake, createVideoMakeStore, identifyVideoMake, readPrivateVideoJson } from './video-make.mjs';
 
@@ -67,7 +67,7 @@ export async function runOwnerVideoMake({ action, id, dataDir, rootDir, request 
     const environmentKeys = ['PIPELINE_COORDINATOR', 'PIPELINE_SCOPE', 'VM_CREATIVE_BUDGET_CNY', 'VM_CREATIVE_MAX_CALLS',
       'VM_CREATIVE_MAX_TOKENS', 'VM_CREATIVE_MAX_WALL_MS', 'VM_CREATIVE_MODEL_PRICES', 'VM_CREATIVE_EXTERNAL_PRICES'];
     authority.sha256 = createHash('sha256').update(JSON.stringify([authority.sha256, config.portraitReuseManifest?.sha256 ?? null,
-      environmentKeys.map(key => config.env[key] ?? null)])).digest('hex');
+      textModelReadiness(config.env).model, environmentKeys.map(key => config.env[key] ?? null)])).digest('hex');
   }
   const runtime = createVideoRuntime({ rootDir, dataDir: config.dataRoot, portraitReuseManifestPath, serveWorkbench: config.serveWorkbench,
     logger: message => process.stderr.write('[video] ' + message + '\n') });

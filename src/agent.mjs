@@ -7,6 +7,8 @@ import { publicVideoCapabilities, publicVideoStatus } from './http/video-runtime
 import { standardVideoIntent, standardWorkflowDescriptor } from './video-runtime/standard-workflow.mjs';
 import { AGENT_GUIDE_ID, agentGuideDescriptor, readAiAgentGuide } from './ai-agent-guide.mjs';
 import { clientRuntimeEnvironment } from './ai-workbench-paths.mjs';
+import { editorialCapabilities, invokeEditorial } from './agent-editorial.mjs';
+import { SYSTEM_IDENTITY } from './domain/identity.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PRODUCTION_PLAN = 'growth.video.production.plan';
@@ -71,6 +73,8 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
   });
   specials.push(standardWorkflowDescriptor);
   specials.push(agentGuideDescriptor);
+  specials.push(...editorialCapabilities);
+  const editorialIds = new Set(editorialCapabilities.map(item => item.id));
   const entries = new Map([...catalog.entries, ...specials.map(item => [item.id, item])]);
   async function stopManaged() {
     if (!owned) return false;
@@ -123,7 +127,8 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
     return pending;
   }
   return {
-    list() { return { schemaVersion: 'pengmanager.agent-capabilities/v1', productId: 'pengmanager-system', embeddedProductId: catalog.product.productId, bundleId: catalog.bundle, capabilities: [...entries.values()] }; },
+    list() { return { schemaVersion: 'pengmanager.agent-capabilities/v1', productId: SYSTEM_IDENTITY.id,
+      productName: SYSTEM_IDENTITY.nameZh, embeddedProductId: catalog.product.productId, bundleId: catalog.bundle, capabilities: [...entries.values()] }; },
     describe(id) { const descriptor = entries.get(id); if (!descriptor) throw new AgentError('NOT_FOUND', 'The capability is not registered.'); return descriptor; },
     tools() {
       return [...native.mcpTools(catalog).map(tool => ({ ...tool, name: tool.name.replace(/^workloom_/, 'pengmanager_') })), ...specials.map(item => ({
@@ -141,6 +146,7 @@ export async function createPengManagerAgent({ rootDir = ROOT, dataDir, env = pr
       if (id === standardWorkflowDescriptor.id) return standardVideoIntent(input);
       if (id === AGENT_GUIDE_ID) { emptyInput(input); return readAiAgentGuide({ rootDir: config.rootDir, dataDir: config.dataRoot,
         nodePath: config.node, runtimeEnvironment: clientRuntimeEnvironment(config) }); }
+      if (editorialIds.has(id)) return invokeEditorial(id, native.validateInput(descriptor, input), { env: config.env, fetchImplementation });
       if (id === VIDEO_STOP) {
         emptyInput(input);
         const stoppedByThisProcess = await stopManaged();

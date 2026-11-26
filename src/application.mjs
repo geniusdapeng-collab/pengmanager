@@ -4,8 +4,8 @@ import { loadSeedState, migratePengManagerIdentity, migrateEditorialState } from
 import { GeoOsService } from "./services/geo-os-service.mjs";
 import { LivePipelineService } from "./services/live-pipeline.mjs";
 import { createGeoOsServer } from "./http/server.mjs";
-import { DeepSeekAdapter } from "./adapters/deepseek.mjs";
-import { resolveDeepSeekApiKey } from "./adapters/auth.mjs";
+import { CodexAdapter } from "./adapters/codex.mjs";
+import { SYSTEM_IDENTITY } from "./domain/identity.mjs";
 import { GitHubAdapter } from "./adapters/github.mjs";
 import { VideoEditAdapter } from "./adapters/video-edit.mjs";
 import { PersonalGeoEngine } from "./engines/geo-evidence.mjs";
@@ -26,7 +26,7 @@ import { migrateContentDirectorState } from "./services/content-director-migrati
 import { ContentDirectorModel } from "./services/content-director-model.mjs";
 import { ContentDirectorService } from "./services/content-director-service.mjs";
 import { createAiApproval } from "./services/ai-approval.mjs";
-import { DEEPSEEK_OFFICIAL_BASE_URL } from "./model-routing/registry.mjs";
+import { codexTextRegistration } from "./model-routing/codex.mjs";
 import { contentOpsAdapterBindings } from "./content-ops-worker/adapters.mjs";
 import { randomUUID } from "node:crypto";
 
@@ -61,20 +61,12 @@ export async function createPengManagerApplication({
   await migratePengManagerIdentity(store, dataDir);
   const publicOrigin = env.PUBLIC_ORIGIN || `http://${host === "::1" ? "[::1]" : host}:${port}`;
   await migrateEditorialState(store, { publicOrigin });
-  let localApprovalModel;
+  const textModel = new CodexAdapter({ env });
   const aiApproval = suppliedAiApproval ?? createAiApproval({
     directory: join(dirname(dataFile), "ai-approval"),
     origin: new URL(publicOrigin).origin,
-    model: env.NODE_ENV === "production" ? undefined : {
-      completeTask(request) {
-        localApprovalModel ??= new DeepSeekAdapter({
-          apiKey: resolveDeepSeekApiKey(env),
-          baseUrl: env.LLM_BASE_URL || env.DEEPSEEK_BASE_URL || DEEPSEEK_OFFICIAL_BASE_URL,
-          maxRetries: 0,
-        });
-        return localApprovalModel.completeTask(request);
-      },
-    },
+    modelId: codexTextRegistration({ env }).officialModelId,
+    model: env.NODE_ENV === "production" ? undefined : textModel,
   });
   const service = new GeoOsService({ store, finalContentBackup, aiApproval });
   let editorial;
@@ -93,7 +85,7 @@ export async function createPengManagerApplication({
   let runtime = videoRuntime;
   const contentDirector = new ContentDirectorService({
     store,
-    model: new ContentDirectorModel({ deepSeek: new DeepSeekAdapter() }),
+    model: new ContentDirectorModel({ model: textModel }),
     editorial,
     mediaAssets,
     contentOps,
@@ -110,7 +102,7 @@ export async function createPengManagerApplication({
   }
   const accountOperations = new AccountOperationsService({ service, productionArtifacts, mediaAssets, aiApproval });
   const geoEngine = suppliedGeoEngine ?? new PersonalGeoEngine({
-    rootDir, ...(env.GEO_ENGINE_DB ? { databasePath: resolve(rootDir, env.GEO_ENGINE_DB) } : {}),
+    rootDir, env, ...(env.GEO_ENGINE_DB ? { databasePath: resolve(rootDir, env.GEO_ENGINE_DB) } : {}),
     controlQueries: store.snapshot().queries,
     aiApproval,
   });
@@ -131,7 +123,7 @@ export async function createPengManagerApplication({
   }
   constructedRuntime = runtime;
   const livePipeline = suppliedLivePipeline ?? new LivePipelineService({
-    service, deepSeek: new DeepSeekAdapter(), github: new GitHubAdapter(), geoEngine,
+    service, model: textModel, github: new GitHubAdapter(), geoEngine,
     videoEdit: new VideoEditAdapter({ upstreamRoot: join(rootDir, "engines", "video-edit") }), mediaEngine,
   });
   const server = createGeoOsServer({ service, livePipeline, geoEngine, videoRuntime: runtime,
@@ -163,7 +155,7 @@ export async function createPengManagerApplication({
           contentDirector.startApprovalContinuation(logger);
           contentOps.startApprovalContinuation(logger);
         }
-        logger.log?.(`鹏经理系统 · PengManager System: http://${options.host ?? host}:${server.address().port}`);
+        logger.log?.(`${SYSTEM_IDENTITY.nameZh} · ${SYSTEM_IDENTITY.nameEn}: http://${options.host ?? host}:${server.address().port}`);
         videoStart = Promise.resolve().then(() => stopping || env.ENABLE_MEDIA_RENDER === "false" ? false : runtime.start()).then(
           result => result,
           () => { logger.error?.("视频工作台启动未完成；现有控制台继续运行，请查看视频工作台状态并运行本地诊断。"); return false; },

@@ -13,8 +13,8 @@
   },
   "providers": [
     "fixture",
-    "deepseek",
-    "deepseek-search",
+    "codex",
+    "codex-search",
     "manual-import"
   ],
   "publishers": [

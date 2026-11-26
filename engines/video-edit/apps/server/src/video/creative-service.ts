@@ -4,7 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { PoolClient } from "pg";
 import { getAppPool, withWorkspace, type TenantScope } from "@workloom/db";
-import { DEEPSEEK_FLASH_CONTEXT_TOKENS, DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS, DEEPSEEK_INPUT_TOKEN_BASIS,
+import { CODEX_INPUT_TOKEN_BASIS, CODEX_REQUEST_BODY_LIMIT_BYTES, codexVideoRegistration, usesCodexText,
+  DEEPSEEK_FLASH_CONTEXT_TOKENS, DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS, DEEPSEEK_INPUT_TOKEN_BASIS,
   DEEPSEEK_REQUEST_BODY_LIMIT_BYTES } from "@workloom/base/model-router";
 import {
   assertCreativeContract, compileCreativeContract, creativeCanonical, creativeHash, CreativeContractError,
@@ -16,7 +17,7 @@ import { archiveWorkDir } from "./archive-host.js";
 import type { CreativeExternalRequest } from "./creative-external-budget.js";
 import { createMarketingGateEvidenceGuard } from "./marketing-gate-evidence.js";
 import { compileLegacyShadowPlan } from "./pipeline/shadow.js";
-import { assertCreativeConfigurationReady } from "./creative-config.js";
+import { assertCreativeConfigurationReady, creativeModelCostMicros } from "./creative-config.js";
 
 export const CREATIVE_PLAN = "workloom.video-creative/v1";
 const SHA = /^[a-f0-9]{64}$/;
@@ -81,9 +82,6 @@ function budgetFor(model: string): Budget {
   } catch (error) {
     return creativeError("CREATIVE_BUDGET_UNCONFIGURED", error instanceof Error ? error.message : String(error));
   }
-}
-function costMicros(input: number, output: number, price: Price) {
-  return Math.ceil(input * price.inputCnyPerMillion + output * price.outputCnyPerMillion);
 }
 async function budgetTotals(client: PoolClient, scope: CreativeScope) {
   const result = await client.query<{ pending: boolean; calls: string; micros: string; tokens: string }>(
@@ -330,6 +328,7 @@ export async function createCreativeExecutionSession(input: SessionInput) {
   const { runId, model } = input;
   const actor = input.actorId ?? "system:video-creative", enforced = input.mode === "enforce";
   const started = performance.now(), budget = enforced ? budgetFor(model) : null;
+  const codex = usesCodexText() ? codexVideoRegistration() : undefined;
   const planHash = creativeHash({ version: CREATIVE_PLAN, mode: input.mode, model });
   const seed = { scope, rawIntent: input.rawIntent, metadata: input.metadata, isMarketing: input.isMarketing };
   let contract = input.expectedContract ?? compileCreativeContract(seed);
@@ -507,20 +506,26 @@ export async function createCreativeExecutionSession(input: SessionInput) {
   async function beforeModelCall(request: ModelRequest): Promise<string> {
     const imageInputTokens = request.imageInputTokens === undefined ? 0 : request.imageInputTokens;
     const inputLimit = request.inputTokenUpperBound, outputLimit = request.maxOutputTokens;
-    if (!budget || request.model !== model || !SHA.test(request.requestHash)
-      || request.inputTokenBasis !== DEEPSEEK_INPUT_TOKEN_BASIS || request.requestBytes > DEEPSEEK_REQUEST_BODY_LIMIT_BYTES
+    const inputBasis = codex ? CODEX_INPUT_TOKEN_BASIS : DEEPSEEK_INPUT_TOKEN_BASIS;
+    const requestByteLimit = codex ? CODEX_REQUEST_BODY_LIMIT_BYTES : DEEPSEEK_REQUEST_BODY_LIMIT_BYTES;
+    const outputTokenLimit = codex?.maxOutputTokens ?? DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS;
+    const contextTokenLimit = codex?.contextTokens ?? DEEPSEEK_FLASH_CONTEXT_TOKENS;
+    if (!budget || request.model !== model || (codex && model !== codex.officialModelId) || !SHA.test(request.requestHash)
+      || request.inputTokenBasis !== inputBasis || request.requestBytes > requestByteLimit
       || request.requestBytes !== request.inputChars
       || (request.shotId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(request.shotId))
       || !Number.isSafeInteger(imageInputTokens) || imageInputTokens < 0
       || ![request.requestBytes, request.inputTokenEstimate, inputLimit, outputLimit, request.attempt].every(n => Number.isSafeInteger(n) && n > 0)
-      || inputLimit < request.inputTokenEstimate || request.inputTokenEstimate < imageInputTokens || outputLimit > DEEPSEEK_FLASH_MAX_OUTPUT_TOKENS
-      || inputLimit + outputLimit > DEEPSEEK_FLASH_CONTEXT_TOKENS) {
+      || inputLimit < request.inputTokenEstimate || request.inputTokenEstimate < imageInputTokens || outputLimit > outputTokenLimit
+      || inputLimit + outputLimit > contextTokenLimit) {
       return creativeError("CREATIVE_BUDGET_REQUEST_INVALID", "模型请求缺少可信价格、活动阶段或请求边界");
     }
     // Wire bytes and model tokens are separate. The transport plan already includes the vision allowance.
-    const tokens = inputLimit + outputLimit, micros = costMicros(inputLimit, outputLimit, budget.price);
+    const tokens = inputLimit + outputLimit;
+    const micros = creativeModelCostMicros(inputLimit, outputLimit, budget.price, codex?.officialModelId);
     return reserve(modelOperation, request.attempt, request.requestHash,
-      { ...request, imageInputTokens, inputLimit, outputLimit, price: budget.price }, micros, tokens);
+      { ...request, imageInputTokens, inputLimit, outputLimit, price: budget.price,
+        ...(codex ? { pricingModel: codex.officialModelId, pricingServiceTier: "default" } : {}) }, micros, tokens);
   }
 
   async function beforeExternalCall(request: CreativeExternalRequest & { attempt: number }) {
@@ -607,7 +612,7 @@ export async function createCreativeExecutionSession(input: SessionInput) {
         [reservation, valid ? (outcome.success ? "accepted" : "failed") : "unknown",
           creativeCanonical(valid ? { usageKnown: true, success: outcome.success, ...usage, ...wireEvidence }
             : { usageKnown: false, ...unknownReceipt }),
-          creativeCanonical(valid ? { micros: costMicros(inputTokens, outputTokens, budget.price), tokens: inputTokens + outputTokens, reserved: false } : operation.cost)],
+          creativeCanonical(valid ? { micros: creativeModelCostMicros(inputTokens, outputTokens, budget.price, codex?.officialModelId), tokens: inputTokens + outputTokens, reserved: false } : operation.cost)],
       );
       return valid;
     });

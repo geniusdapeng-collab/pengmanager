@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runtimeConfig } from './video-runtime/config.mjs';
 import { clientRuntimeEnvironment, validatedModelEnvFile } from './ai-workbench-paths.mjs';
+import { SYSTEM_IDENTITY } from './domain/identity.mjs';
 
 export const AI_WORKBENCH_SERVER = 'pengmanager-video';
 const fail = (code, message) => { const error = new Error(message); error.code = code; throw error; };
@@ -26,7 +27,7 @@ export function buildAiWorkbenchConfig({ rootDir, dataDir, nodePath = process.ex
   try {
     config = runtimeConfig({ rootDir, dataDir, serveWorkbench: false });
     const metadata = JSON.parse(fs.readFileSync(path.join(config.rootDir, 'package.json'), 'utf8'));
-    if (metadata.name !== 'pengmanager-system') throw new Error('Wrong product.');
+    if (metadata.name !== SYSTEM_IDENTITY.id) throw new Error('Wrong product.');
     for (const relative of ['scripts/agent-mcp.mjs', 'scripts/video-standard.mjs']) {
       const file = path.join(config.rootDir, relative);
       if (!fs.statSync(file).isFile() || fs.realpathSync(file) !== file) throw new Error('Invalid entry.');
@@ -63,7 +64,8 @@ export function buildAiWorkbenchConfig({ rootDir, dataDir, nodePath = process.ex
   const qoderConfig = { mcpServers: { [AI_WORKBENCH_SERVER]: { type: 'stdio', ...server } } };
   const genericConfig = { mcpServers: { [AI_WORKBENCH_SERVER]: server } };
   return {
-    schemaVersion: 'pengmanager.ai-workbench-config/v1', productId: 'pengmanager-system', serverName: AI_WORKBENCH_SERVER,
+    schemaVersion: 'pengmanager.ai-workbench-config/v1', productId: SYSTEM_IDENTITY.id,
+    productName: SYSTEM_IDENTITY.nameZh, serverName: AI_WORKBENCH_SERVER,
     rootDir: config.rootDir, dataDir: config.dataRoot, command, args, cwd: server.cwd, env,
     modelEnvFile: modelFile, codexToml, qoderConfig, genericConfig,
     providerCallsPerformed: false, configurationWritten: false,

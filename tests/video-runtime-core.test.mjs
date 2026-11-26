@@ -46,40 +46,30 @@ test('redaction removes dynamic credentials, database URLs and authorization val
   for(const value of [secret,next,state.credentials.jwt,'owner:password'])assert.equal(result.includes(value),false);
   assert.equal(equalSecret('a','é'),false);assert.equal(equalSecret(null,'a'),false);assert.equal(equalSecret('abc','abc'),true);
 });
-test('text readiness follows the native provider contract rather than vendor-only keys',()=>{
-  assert.equal(textModelReadiness({DEEPSEEK_API_KEY:'present'}).configured,false);
-  assert.equal(textModelReadiness({LLM_PROVIDER:'mock',LLM_API_KEY:'present',LLM_BASE_URL:'http://127.0.0.1',LLM_MODEL:'fixture'}).configured,false);
-  assert.equal(textModelReadiness({LLM_PROVIDER:'openai',LLM_API_KEY:'present',LLM_BASE_URL:'http://127.0.0.1',LLM_MODEL:'deepseek-flash'}).configured,false);
-  assert.equal(textModelReadiness({LLM_PROVIDER:'deepseek',LLM_API_KEY:'present',LLM_BASE_URL:'http://127.0.0.1',LLM_MODEL:'deepseek-chat'}).configured,false);
-  assert.equal(textModelReadiness({LLM_PROVIDER:'deepseek',LLM_API_KEY:'present',LLM_BASE_URL:'http://127.0.0.1',LLM_MODEL:'deepseek-flash'}).configured,true);
+test('native video requires the Codex edition model and an OpenAI process credential',()=>{
+  assert.deepEqual(textModelReadiness({DEEPSEEK_API_KEY:'present'}).missing,['OPENAI_API_KEY']);
+  assert.deepEqual(textModelReadiness({OPENAI_API_KEY:'fixture', PENGMANAGER_CODEX_MODEL:'deepseek-flash'}).missing,['registered-codex-text-model']);
+  const ready = textModelReadiness({OPENAI_API_KEY:'fixture', PENGMANAGER_CODEX_MODEL:'gpt-6.2-astra'});
+  assert.equal(ready.configured,true);
+  assert.equal(ready.model,'gpt-6.2-astra');
 });
-test('validated DeepSeek launch aliases and default model reach the native process without changing host config',t=>{
+test('the managed native child receives one Codex registration and discards legacy text credentials',t=>{
   const f=fixture(t);
-  for(const aliasModel of ['deepseek-v4-flash',undefined]){
-    const env={LLM_PROVIDER:undefined,LLM_BASE_URL:undefined,LLM_API_KEY:undefined,LLM_MODEL:undefined,
-      DEEPSEEK_BASE_URL:'https://model.example.test',DEEPSEEK_API_KEY:'test-only-deepseek-alias',DEEPSEEK_MODEL:aliasModel};
-    const config=f.config({env}),before={...config.env},state=loadCredentials(config).value;
-    assert.equal(textModelReadiness(config.env).configured,true);
-    const child=nativeEnvironment(config,state,databaseUrls(config,state),'fixture-desktop-bootstrap');
-    assert.equal(child.LLM_PROVIDER,'deepseek');
-    assert.equal(child.LLM_BASE_URL,env.DEEPSEEK_BASE_URL);
-    assert.equal(child.LLM_API_KEY,env.DEEPSEEK_API_KEY);
-    assert.equal(child.LLM_MODEL,'deepseek-flash');
-    assert.equal(child.WORKLOOM_ENV_PERSIST_MODE,'process-only');
-    assert.deepEqual(config.env,before);
-  }
-});
-test('explicit launch settings take precedence and invalid configurations are passed through unchanged',t=>{
-  const f=fixture(t),aliases={DEEPSEEK_BASE_URL:'https://alias.example.test',DEEPSEEK_API_KEY:'test-only-alias',DEEPSEEK_MODEL:'deepseek-flash'};
-  const explicit={LLM_PROVIDER:'deepseek',LLM_BASE_URL:'https://explicit.example.test',LLM_API_KEY:'test-only-explicit',LLM_MODEL:'deepseek-flash'};
-  const configs=[explicit,{...explicit,LLM_MODEL:'deepseek-chat',LLM_BASE_URL:undefined,LLM_API_KEY:undefined},
-    {...explicit,LLM_PROVIDER:'mock',LLM_MODEL:undefined,LLM_BASE_URL:undefined,LLM_API_KEY:undefined}];
-  for(const [index,settings] of configs.entries()){
-    const config=f.config({env:{...aliases,...settings}}),state=loadCredentials(config).value;
-    assert.equal(textModelReadiness(config.env).configured,index===0);
-    const child=nativeEnvironment(config,state,databaseUrls(config,state),'fixture-desktop-bootstrap');
-    for(const [name,value] of Object.entries(settings))assert.equal(child[name],value);
-  }
+  const env={OPENAI_API_KEY:'fixture-openai', PENGMANAGER_CODEX_MODEL:'gpt-6.2-astra',
+    LLM_PROVIDER:'deepseek', LLM_MODEL:'deepseek-flash', LLM_FORCE_MODEL:'deepseek-flash', LLM_API_KEY:'legacy-key',
+    DEEPSEEK_API_KEY:'legacy-key', DEEPSEEK_BASE_URL:'https://old.example.test'};
+  const config=f.config({env}),before={...config.env},state=loadCredentials(config).value;
+  const child=nativeEnvironment(config,state,databaseUrls(config,state),'fixture-desktop-bootstrap');
+  assert.equal(child.LLM_PROVIDER,'codex');
+  assert.equal(child.LLM_BASE_URL,'https://api.openai.com/v1');
+  assert.equal(child.LLM_MODEL,'gpt-6.2-astra');
+  assert.equal(child.OPENAI_API_KEY,env.OPENAI_API_KEY);
+  assert.equal(child.LLM_API_KEY,'');
+  for(const key of ['DEEPSEEK_API_KEY','DEEPSEEK_BASE_URL','LLM_FORCE_MODEL']) assert.equal(child[key],undefined);
+  assert.equal(child.WORKLOOM_ENV_PERSIST_MODE,'process-only');
+  assert.deepEqual(config.env,before);
+  assert.throws(()=>nativeEnvironment(config,state,databaseUrls(config,state),'fixture-desktop-bootstrap',
+    {OPENAI_API_KEY:'attempted-replacement'}),{code:'TOOL_ENV_INVALID'});
 });
 test('Codex CLI and MCP mode is headless by default with an explicit future workbench opt-in',t=>{
   const f=fixture(t);assert.equal(f.config({env:{PENGMANAGER_VIDEO_WORKBENCH:'0'}}).serveWorkbench,false);

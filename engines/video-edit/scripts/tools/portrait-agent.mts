@@ -37,6 +37,7 @@ import {
   reviewStage, runPortraitAgent
 } from "../../packages/video-studio/src/index.js";
 import { assertPortraitOwnerWritePaths, buildPortraitOwnerAuthorization, EXPLICIT_PORTRAIT_AUTHORIZATION } from "../../packages/video-studio/src/portrait-owner-authorization.js";
+import { CodexTextProvider } from "../../packages/base/model-router/codex-provider.js";
 import { OpenAiCompatibleProvider } from "../../packages/base/model-router/providers.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -369,11 +370,9 @@ async function main(): Promise<void> {
     if (withLikeness) {
       if (!Number.isFinite(minLikeness) || minLikeness < 0 || minLikeness > 100) throw new Error("--min-likeness 非法（0–100）");
       const llm = resolveProducerLlm(ENV);
-      if (!llm) throw new Error("--with-likeness 需要评审模型（LLM_BASE_URL / LLM_API_KEY 或 DEEPSEEK_*）");
-      const provider = new OpenAiCompatibleProvider(llm.model, {
-        baseUrl: llm.baseUrl,
-        apiKey: llm.apiKey,
-      });
+      if (!llm) throw new Error("--with-likeness 需要已配置的评审模型");
+      const provider = llm.codexEnv ? new CodexTextProvider({ model: llm.model, env: llm.codexEnv })
+        : new OpenAiCompatibleProvider(llm.model, { baseUrl: llm.baseUrl, apiKey: llm.apiKey });
       const tmpDir = mkdtempSync(join(homedir(), ".workloom-portrait-"));
       try {
         /** 基准同样压到可发包再送（真机：5.9MB PNG 直接 base64 会被端点拒或断连） */

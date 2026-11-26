@@ -1,6 +1,6 @@
-# 鹏经理系统 · PengManager
+# 鹏经理Codex版 · PengManager Codex Edition
 
-鹏经理是一套本地优先的内容运营和 GEO 工作台。用它整理中英文稿件、原始资料、配图与审核记录，管理网站发布和渠道交付，并持续观察 AI 回答如何提及和引用关注的主题。
+鹏经理Codex版是一套本地优先的内容运营、视频与 GEO 工作台。用 Codex 通过 CLI 或 MCP 发现数字员工、规划图文和视频任务，并沿同一任务查询生产、审核与交付回执。系统内的文本生产使用 OpenAI Responses，默认模型为 `gpt-6.2-sol`。
 
 [English](README.en.md) · [架构](#架构) · [内容发布](docs/CONTENT-PUBLISHING.md) · [Agent 接入](docs/AI-AGENT-GUIDE.md) · [Apache-2.0](LICENSE)
 
@@ -10,16 +10,16 @@
 | --- | --- |
 | **编辑和出版** | 在管理台管理选题、稿件、素材与审核。网站从已批准的发布版本读取内容，编辑可以回查稿件版本、授权与结果。 |
 | **渠道内容运营** | 为不同平台准备渠道稿和交付包。记录发起、审批、结果和回执。真实平台连接器按部署配置和授权启用。 |
-| **个人或品牌 GEO** | 保存固定问题、AI 回答、引用和模型出处，在 SQLite 中查看复测与证据。随仓示例是虚构数据，联网采集需配置自己的模型和来源。 |
-| **媒体与视频接入** | 包含与生产仓一致的原生视频引擎源码，覆盖前期、AI 生成、素材剪辑、口播和后期交付。实跑需配置本机工具、供应商与授权素材。 |
+| **个人或品牌 GEO** | 保存固定问题、AI 回答、引用和模型出处，在 SQLite 中查看复测与证据。获得授权后，可使用 `pnpm live:codex` 通过已配置的 OpenAI 账户采集。 |
+| **媒体与视频接入** | 使用内置原生引擎完成前期、AI 生成、素材剪辑、口播和后期交付。实跑需配置本机工具、媒体供应商与授权素材。 |
 
 ## 本地体验
 
 先准备 Node.js 24 和 pnpm 11.25.0。下面的演示使用环回地址和临时数据目录，载入随仓虚构示例。
 
 ```bash
-git clone https://github.com/geniusdapeng-collab/pengmanager.git
-cd pengmanager
+git clone https://github.com/geniusdapeng-collab/pengmanager-codex.git
+cd pengmanager-codex
 pnpm install --frozen-lockfile
 pnpm demo
 ```
@@ -28,7 +28,15 @@ pnpm demo
 - 查看 [中文网站](http://127.0.0.1:4318/zh) 和 [English site](http://127.0.0.1:4318/en)。
 - 端口被占用时，可运行 `PENGMANAGER_DEMO_PORT=4319 pnpm demo`。结束演示按 **Ctrl+C**。
 
-需要持久化时，参考 [环境变量模板](.env.example) 与 [部署说明](docs/DEPLOYMENT.md)，使用 `pnpm start`。可以使用自己的模型、GitHub 仓库和数据目录。连接器读取当前运行环境，实际发布和模型调用需要自己的账户、权限和审批。
+需要持久化时，按[部署说明](docs/DEPLOYMENT.md)启动独立数据目录。演示使用虚构数据和本机回环地址，无需 OpenAI 或媒体供应商账户。
+
+## 用 Codex 启动生产流程
+
+1. 在检出的仓库启动 Codex，让它运行 `pnpm agent:guide` 和 `node scripts/agent.mjs list`。使用 MCP 时，运行 `pnpm agent:config --client codex` 导出配置，在 Codex 中添加该工位，先调用 `pengmanager_agent_guide`。
+2. 图文先调用 `pengmanager_editorial_plan` 识别生产线，登记图文任务后用原 job ID 读回。具体部署、图文执行入口和授权见[接入指南](docs/AI-AGENT-GUIDE.md)。
+3. 视频先调用 `pengmanager_video_workflow` 和 `pengmanager_video_preflight`。有真实授权、预算和素材的任务使用标准视频 CLI，按同一 job ID 跟进。 [原生视频接入](docs/CODEX-VIDEO-QUICKSTART.md)
+
+Codex 客户端使用自己的登录，应用及授权执行工位需要独立配置 `OPENAI_API_KEY`。用 `PENGMANAGER_CODEX_MODEL` 选择本版登记的 `gpt-6.2-sol` 或 `gpt-6.2-astra`。实际生成视频、口播等媒体还需启用相应供应商和本机工具。 [OpenAI 模型指南](https://developers.openai.com/api/docs/guides/latest-model)
 
 ## 架构
 
@@ -40,7 +48,9 @@ flowchart LR
   Host --> Geo["内置 GeoEvidence 引擎"]
   Editorial --> Files["本地状态、媒体和回执"]
   Geo --> SQLite["SQLite 问题、回答和引用"]
-  Host -.单独配置.-> Adapters["模型、发布和视频适配器"]
+  Codex["Codex CLI / MCP"] --> Host
+  Host --> OpenAI["OpenAI Responses · 文本与审核"]
+  Host -.单独配置.-> Adapters["发布和媒体适配器"]
 ```
 
 | 路径 | 内容 |
@@ -60,6 +70,6 @@ pnpm test:engines
 pnpm smoke
 ```
 
-公开仓与生产仓使用同一份应用和原生视频引擎源码，包含网页、服务端、CLI、编辑与交付链路。发布版按自己的资源清单校验安装。运营数据、供应商凭据，以及需单独许可的曲库、产品图片和 Live2D 资源由部署者提供。 [视频接入说明](docs/CODEX-VIDEO-QUICKSTART.md) · [源码比对与测试](docs/SOURCE-TEST-PROFILES.md)
+开源版包含网页、服务端、CLI、编辑与交付工作流，以及原生视频引擎。发布版按资源清单校验安装。运营数据、供应商凭据，以及需单独许可的曲库、产品图片和 Live2D 资源由部署者提供。 [视频接入说明](docs/CODEX-VIDEO-QUICKSTART.md) · [测试配置](docs/SOURCE-TEST-PROFILES.md)
 
 鹏经理自有代码采用 Apache-2.0。上游代码、字体与模型配套文件的归属和许可证见 [NOTICE](NOTICE)。安全问题入口见 [SECURITY.md](SECURITY.md)。

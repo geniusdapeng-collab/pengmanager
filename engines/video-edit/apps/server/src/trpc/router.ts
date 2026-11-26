@@ -34,7 +34,9 @@ import {
 } from "@workloom/base/review-console";
 import { routeIntent, runAsk, runQuest } from "@workloom/runtime";
 import { LlmIntentClassifier, type IntentClassifier } from "@workloom/runtime";
-import { canonicalDeepSeekModel, OpenAiCompatibleProvider } from "@workloom/base/model-router";
+import { canonicalDeepSeekModel, CodexTextProvider, codexVideoRegistration, OpenAiCompatibleProvider,
+  requireCodexModel, usesCodexText } from "@workloom/base/model-router";
+import { currentLlmVerification, recordLlmVerification } from "../service/llm-verification.js";
 import { llmCall as defaultLlmCall, routedLlmCall, resetLlmAssembly } from "../service/llm.js";
 import { loadDeploymentToolExecutor } from "../runtime/tool-executor.js";
 import {
@@ -281,6 +283,11 @@ function persistLlmEnv(cfg: { provider: string; baseUrl: string; apiKey: string;
 
 /** LLM 装配状态（真实=非 mock 且 baseUrl 齐备；apiKey 可空=免 key 网关） */
 function llmAssembly(): { provider: string; model: string; baseUrl: string; real: boolean } {
+  if (usesCodexText()) {
+    const registration = codexVideoRegistration();
+    return { provider: "codex", model: registration.officialModelId, baseUrl: registration.baseUrl,
+      real: Boolean(process.env.OPENAI_API_KEY?.trim()) };
+  }
   const provider = process.env.LLM_PROVIDER ?? "mock";
   const baseUrl = process.env.LLM_BASE_URL ?? "";
   return {
@@ -293,11 +300,12 @@ function llmAssembly(): { provider: string; model: string; baseUrl: string; real
 
 /** 真实试调探针（落地向导「测试连接」：真实 round-trip 通过才允许保存） */
 async function probeLlm(cfg: { baseUrl: string; apiKey?: string; model: string }): Promise<{ reply: string; latencyMs: number }> {
-  const model = canonicalDeepSeekModel(cfg.model);
-  const provider = new OpenAiCompatibleProvider(model, {
-    baseUrl: cfg.baseUrl,
-    apiKey: cfg.apiKey || undefined,
-  });
+  const provider = usesCodexText()
+    ? new CodexTextProvider({ model: requireCodexModel(cfg.model) })
+    : new OpenAiCompatibleProvider(canonicalDeepSeekModel(cfg.model), {
+        baseUrl: cfg.baseUrl,
+        apiKey: cfg.apiKey || undefined,
+      });
   const t0 = Date.now();
   const res = await provider.chat(
     [{ role: "user", content: "你是企业经营系统的数字员工。请用一句中文回答：你已在线，可以开始工作。" }],
@@ -361,7 +369,10 @@ const onboardingRouter = router({
       return {
         // 缺省按模拟态处理（种子库/历史库均无标记时横幅常显，宁可多提示不可漏提示）
         dataMode: (prof.rows[0]?.data_mode ?? "simulated") as "simulated" | "real",
-        llm: llmAssembly(),
+        llm: {
+          ...llmAssembly(),
+          ...(usesCodexText() ? { currentProcessProbeVerified: currentLlmVerification(scope) !== null, persistence: "process-only" as const } : {}),
+        },
         workspace: { name: ws.rows[0]?.name ?? "", events, members, agents, memories },
         workspaceId: scope.workspaceId,
         bundle: { id: ws.rows[0]?.bundle_id ?? null, isExample: !!ws.rows[0]?.is_example },
@@ -420,7 +431,10 @@ const onboardingRouter = router({
       apiKey: z.string().max(200).default(""),
       model: z.string().min(1).max(80),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      if (usesCodexText() && (ctx.identity.role !== "owner" || input.apiKey || input.baseUrl !== llmAssembly().baseUrl)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Codex 版仅允许所有者测试当前进程的模型配置。" });
+      }
       try {
         const r = await probeLlm(input);
         return { ok: true as const, ...r };
@@ -439,8 +453,13 @@ const onboardingRouter = router({
     }))
     .mutation(async ({ ctx, input }) => {
       const scope = scopeOf(ctx.identity);
+      const codex = usesCodexText();
+      if (codex && (ctx.identity.role !== "owner" || input.provider !== "codex" || input.apiKey ||
+          input.baseUrl !== llmAssembly().baseUrl || input.model !== llmAssembly().model)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Codex 版由所有者通过启动环境登记模型与密钥。" });
+      }
       if (input.provider !== "mock") {
-        if (input.provider !== "deepseek") {
+        if (input.provider !== (codex ? "codex" : "deepseek")) {
           throw new TRPCError({
             code: "BAD_REQUEST",
             message: "文本模型只能配置 deepseek，并解析到 text.primary=deepseek-flash",
@@ -455,18 +474,16 @@ const onboardingRouter = router({
           throw new TRPCError({ code: "BAD_REQUEST", message: `模型实测未通过，未保存：${err instanceof Error ? err.message : err}` });
         }
       }
-      const configuredModel = input.provider === "mock" ? "" : canonicalDeepSeekModel(input.model);
-      persistLlmEnv({
-        ...input,
-        model: configuredModel,
-      });
+      const configuredModel = codex ? requireCodexModel(input.model) :
+        input.provider === "mock" ? "" : canonicalDeepSeekModel(input.model);
+      if (!codex) persistLlmEnv({ ...input, model: configuredModel });
       // D16（#1/A）：事件写入并入显式事务（.env 落盘不可回滚，故事件写在其成功后同一 COMMIT 提交）
       const llmClient = await getAppPool().connect();
       try {
         await llmClient.query("BEGIN");
         await llmClient.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
         await llmClient.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
-        await gatewayAppendOnClient(llmClient, {
+        const event = await gatewayAppendOnClient(llmClient, {
           ...scope, actor: { id: ctx.identity.memberNo, type: "human" }, sessionId: `onboarding-${scope.workspaceId}`,
         }, {
           who: { type: "human", id: ctx.identity.memberNo },
@@ -476,15 +493,19 @@ const onboardingRouter = router({
             action: "onboarding.llm_configured",
             params: {
               provider: input.provider, base_url: input.baseUrl, model: configuredModel,
-              key_mask: input.apiKey ? `***${input.apiKey.slice(-4)}` : "(免 key 网关)",
+              ...(!codex ? { key_mask: input.apiKey ? `***${input.apiKey.slice(-4)}` : "(免 key 网关)" }
+                : { probe_verified: true, persistence: "process-only" }),
             },
             after: { real: input.provider !== "mock" },
-            basis: ["落地向导：真实大模型装配（实测通过后写回 .env 四变量，全链即时生效）"],
+            basis: [codex ? "落地向导：当前 OpenAI Responses 进程试调通过"
+              : "落地向导：真实大模型装配（实测通过后写回 .env 四变量，全链即时生效）"],
           },
           rule_impact: [],
           model_trace: { model_id: "human-operator", tier: "standard" },
         });
         await llmClient.query("COMMIT");
+        if (codex) recordLlmVerification(scope, { provider: "codex", baseUrl: input.baseUrl, model: configuredModel, apiKey: "" },
+          { eventId: event.eventId, persistence: "process-only" });
       } catch (err) {
         await llmClient.query("ROLLBACK").catch(() => undefined);
         throw err;

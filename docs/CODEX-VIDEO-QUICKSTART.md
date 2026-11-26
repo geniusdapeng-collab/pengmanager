@@ -1,8 +1,8 @@
-# 原生视频运行与 Agent 接入
+# 鹏经理Codex版原生视频接入
 
 鹏经理包含原生 Edit 引擎、PostgreSQL 启动编排、模型路由、审批、分镜及渲染服务、剪辑与口播工具，还有正式后期和技术质检。源码位于 [engines/video-edit](../engines/video-edit/) 和 [src/video-runtime](../src/video-runtime/)。
 
-用独立的实例目录配置运行数据和工具，安装 Node.js 与项目锁定的依赖。按流程检查本机环境。
+用 `PENGMANAGER_VIDEO_DATA_DIR` 指定本版独立的实例目录，安装 Node.js 与项目锁定的依赖。实际生成文本方案、分镜和审核判断需要本机执行进程配置 `OPENAI_API_KEY`，模型从 `PENGMANAGER_CODEX_MODEL` 读取。视频、语音和后期继续走原生工具与已授权的媒体供应商。按流程检查本机环境。
 
 ```bash
 pnpm video:doctor

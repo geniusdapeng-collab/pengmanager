@@ -1,4 +1,3 @@
-import { TEXT_PRIMARY_MODEL } from "./registry.mjs";
 import { modelError } from "./errors.mjs";
 
 const THINKING_HIGH = Object.freeze({ type: "enabled", effort: "high" });
@@ -159,7 +158,7 @@ const SCENES = Object.freeze({
 export const MODEL_POLICY = Object.freeze({
   schemaVersion: "workloom.model-policy/v1",
   policyVersion: "2026-11-17.1",
-  modelKey: TEXT_PRIMARY_MODEL.key,
+  modelKey: "text.primary",
   defaults: Object.freeze({
     outputBudget: "maximum",
     fallback: "same-model-only",

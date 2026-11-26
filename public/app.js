@@ -177,8 +177,8 @@ function primaryProfile() {
 
 function renderIdentity() {
   const system = state.data.system ?? {};
-  const nameZh = system.nameZh || "鹏经理系统";
-  const nameEn = system.nameEn || "PengManager System";
+  const nameZh = system.nameZh || "鹏经理Codex版";
+  const nameEn = system.nameEn || "PengManager Codex Edition";
   const profile = primaryProfile();
   for (const selector of ["#brand-name", "#system-name"]) {
     document.querySelector(selector).textContent = nameZh;
@@ -217,7 +217,7 @@ async function loadAdapterHealth() {
   try {
     const health = await api("/api/adapters/health");
     const labels = {
-      deepSeek: "DeepSeek 模型",
+      textModel: "Codex 文本模型",
       github: "GitHub API",
       geoEvidence: "GeoEvidence",
       videoEdit: "video-edit",
@@ -227,7 +227,7 @@ async function loadAdapterHealth() {
       .map(([name, item]) => {
         const ok = item?.ok === true;
         const detail =
-          name === "deepSeek"
+          name === "textModel"
             ? item.model || item.baseUrl
             : name === "github"
               ? item.repository

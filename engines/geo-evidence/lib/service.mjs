@@ -4,10 +4,9 @@ import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import {
   analyzeAnswer,
-  parseCitations,
   sha256,
 } from "./core.mjs";
-import { createProvider, getProviderCapabilities } from "./providers.mjs";
+import { createProvider, getProviderCapabilities, isCodexProvider } from "./providers.mjs";
 import {
   PERSONAL_ARTICLE_TOPICS,
   PERSONAL_GEO_CASE,
@@ -28,10 +27,11 @@ function mergeProviderCitations(
   analysis,
   providerCitations = [],
   caseConfig = PERSONAL_GEO_CASE,
+  providerOnly = false,
 ) {
   const combined = [];
   const seen = new Set();
-  for (const citation of [...(analysis.citations ?? []), ...providerCitations]) {
+  for (const citation of [...(providerOnly ? [] : analysis.citations ?? []), ...providerCitations]) {
     if (!citation?.url) continue;
     let parsedUrl;
     try {
@@ -52,6 +52,9 @@ function mergeProviderCitations(
     seen.add(parsedUrl.toString());
   }
   const ownedUrlPrefixes = caseConfig.brand.ownedUrlPrefixes ?? [];
+  const riskyCitations = combined.filter((citation) =>
+    caseConfig.negativeDomains.some((domain) =>
+      citation.domain === domain || citation.domain.endsWith(`.${domain}`)));
   return {
     ...analysis,
     citations: combined,
@@ -59,9 +62,8 @@ function mergeProviderCitations(
       caseConfig.brand.ownedDomains
         .some((domain) => citation.domain === domain || citation.domain.endsWith(`.${domain}`)) ||
       ownedUrlPrefixes.some((prefix) => citation.url.startsWith(prefix))),
-    riskyCitations: combined.filter((citation) =>
-      caseConfig.negativeDomains.some((domain) =>
-        citation.domain === domain || citation.domain.endsWith(`.${domain}`))),
+    riskyCitations,
+    negativeCitation: providerOnly ? analysis.brandNegative && riskyCitations.length > 0 : analysis.negativeCitation,
   };
 }
 
@@ -206,7 +208,7 @@ export class GeoEvidenceService {
       version: "0.1.0",
       case: this.caseConfig.id,
       database: this.store.path,
-      providers: getProviderCapabilities(),
+      providers: getProviderCapabilities(this.env),
       generatedAt: new Date().toISOString(),
     };
   }
@@ -227,8 +229,8 @@ export class GeoEvidenceService {
       file,
       model,
       baseUrl,
-      apiKey: this.env.DEEPSEEK_API_KEY,
-      timeoutMs: this.env.DEEPSEEK_TIMEOUT_MS,
+      env: this.env,
+      fetchImpl: this.fetchImpl,
     });
     await adapter.prepare?.();
     const allQueries = this.store.listQueries({ category, limit: 1000 });
@@ -265,6 +267,7 @@ export class GeoEvidenceService {
           analysis,
           result.citations ?? [],
           this.caseConfig,
+          isCodexProvider(provider),
         );
         const evidenceHash = sha256(JSON.stringify({
           queryId: query.id,
@@ -429,6 +432,7 @@ export class GeoEvidenceService {
         analysis,
         sample.citations ?? [],
         this.caseConfig,
+        isCodexProvider(sample.provider),
       );
       analysis.evidenceHash = sample.evidence_hash;
       this.store.updateSampleAnalysis(sample.id, { analysis, citations: analysis.citations });

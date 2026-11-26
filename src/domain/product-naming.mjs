@@ -44,7 +44,7 @@ const replacements = [
   { source: "growth-matrix-experiment", pattern: /WorkLoom-growthmatrix/gi, replacement: GENERIC_PRODUCT_NAMES.growthMatrixExperiment },
   { source: "growth-experiment-test", pattern: /WorkLoom-growthtest/gi, replacement: GENERIC_PRODUCT_NAMES.growthExperiment },
   { source: "growth-experiment", pattern: /WorkLoom-growth/gi, replacement: GENERIC_PRODUCT_NAMES.growthExperiment },
-  { source: "content-operations", pattern: /PengManager\s+System/gi, replacement: GENERIC_PRODUCT_NAMES.contentOperations },
+  { source: "content-operations", pattern: /PengManager\s+(?:System|Codex\s+Edition)/gi, replacement: GENERIC_PRODUCT_NAMES.contentOperations },
   { source: "ai-visibility-evidence", pattern: /GeoEvidence\s+Studio/gi, replacement: GENERIC_PRODUCT_NAMES.aiVisibilityEvidence },
   { source: "ai-visibility-evidence-short", pattern: /GeoEvidence/gi, replacement: GENERIC_PRODUCT_NAMES.aiVisibilityEvidence },
   { source: "ecommerce-operations", pattern: /Panda\s+Cineforge/gi, replacement: GENERIC_PRODUCT_NAMES.ecommerceOperations },
@@ -72,7 +72,7 @@ const replacements = [
   { source: "hotel-operations", pattern: /workloom-hotel/gi, replacement: GENERIC_PRODUCT_NAMES.hotelOperations },
   { source: "product-management-collaboration", pattern: /workloom-pm/gi, replacement: GENERIC_PRODUCT_NAMES.productManagementCollaboration },
   { source: "content-operations-short", pattern: /PengManager/gi, replacement: GENERIC_PRODUCT_NAMES.contentOperations },
-  { source: "content-operations-cn", pattern: /鹏经理系统|鹏经理/g, replacement: GENERIC_PRODUCT_NAMES.contentOperations },
+  { source: "content-operations-cn", pattern: /鹏经理(?:系统|Codex版)?/gi, replacement: GENERIC_PRODUCT_NAMES.contentOperations },
   { source: "operating-system-cn", pattern: /织元/g, replacement: GENERIC_PRODUCT_NAMES.operatingSystem },
   { source: "operating-system", pattern: /WorkLoom/gi, replacement: GENERIC_PRODUCT_NAMES.operatingSystem },
 ].map(rule => Object.freeze(rule));

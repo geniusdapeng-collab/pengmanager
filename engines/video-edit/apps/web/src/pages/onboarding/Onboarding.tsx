@@ -132,9 +132,11 @@ export default function Onboarding() {
         trpc.onboarding.serviceFrontPublication.query() as Promise<ServiceFrontPublication>,
       ]);
       const payload = draft?.payload ?? {};
-      setProv(payload.provider ?? "deepseek");
-      setBaseUrl(payload.baseUrl ?? PROVIDERS.find((item) => item.key === (payload.provider ?? "deepseek"))?.baseUrl ?? PROVIDERS[0]!.baseUrl);
-      setModel(payload.model ?? PROVIDERS.find((item) => item.key === (payload.provider ?? "deepseek"))?.model ?? PROVIDERS[0]!.model);
+      const processModel = s.llm.provider === "codex";
+      const preparedProvider = PROVIDERS.find(item => item.key === payload.provider) ?? PROVIDERS[0]!;
+      setProv(processModel ? s.llm.provider : preparedProvider.key);
+      setBaseUrl(processModel ? s.llm.baseUrl : payload.baseUrl ?? preparedProvider.baseUrl);
+      setModel(processModel ? s.llm.model : payload.model ?? preparedProvider.model);
       setBizName(payload.businessName ?? s.business?.name ?? s.workspace.name);
       setIndustry(payload.industry ?? s.business?.industry ?? "");
       setNote(payload.note ?? s.business?.note ?? "");
@@ -144,14 +146,15 @@ export default function Onboarding() {
       setPublication(publicationSystemText(front));
       setDraftVersion(draft?.version ?? 0);
       setDraftResponsible(draft?.responsible ?? null);
-      if (s.llm.real) setLlmDone(true);
+      const modelAccepted = processModel ? s.llm.currentProcessProbeVerified === true : s.llm.real;
+      if (modelAccepted) setLlmDone(true);
       const businessReady = Boolean(s.activationGate?.checks.find((check) => check.key === "business")?.ok);
       if (businessReady) setBizDone(true);
       if (draft?.status === "completed") { setStep(4); setDone(true); }
       else if (s.dataMode === "real") setStep(4);
       else if (draft) setStep(Math.max(0, Math.min(4, draft.currentStep)));
-      else if (s.llm.real && businessReady) setStep(3);
-      else if (s.llm.real) setStep(2);
+      else if (modelAccepted && businessReady) setStep(3);
+      else if (modelAccepted) setStep(2);
     }).catch((error) => setErr(safeOnboardingError(error, "落地向导暂时无法加载，请稍后刷新。")));
   }, []);
 
@@ -161,7 +164,10 @@ export default function Onboarding() {
       { label: "数据库连接", ok: true, detail: "事件库在线" },
       { label: "事件库规模", ok: st.workspace.events > 0, detail: `${st.workspace.events} 条五元事件（哈希链可验）` },
       { label: "数字团队", ok: st.workspace.agents > 0, detail: `${st.workspace.agents} 名员工 · ${st.workspace.members} 名人类成员 · ${st.workspace.memories} 条组织记忆` },
-      { label: "大模型", ok: st.llm.real, detail: st.llm.real ? `${st.llm.provider} · ${st.llm.model}（真实推理且试调凭据有效）` : "内置模拟模型，或当前模型配置没有有效试调凭据" },
+      { label: "大模型", ok: st.llm.currentProcessProbeVerified ?? st.llm.real,
+        detail: st.llm.provider === "codex"
+          ? `OpenAI Responses · ${st.llm.model}（${st.llm.currentProcessProbeVerified ? "当前进程试调通过" : "等待当前进程试调"}）`
+          : st.llm.real ? `${st.llm.provider} · ${st.llm.model}` : "内置模拟模型，或当前模型配置没有有效试调凭据" },
       { label: "数据模式", ok: st.dataMode === "real", detail: st.dataMode === "real" ? "真实经营模式" : "模拟演示数据" },
     ];
   }, [st]);
@@ -422,7 +428,19 @@ export default function Onboarding() {
         {/* ② 真实大模型 */}
         {step === 1 && (
           <div className="space-y-4 rounded-xl border border-line bg-panel/70 p-5">
-            <div className="break-words text-sm font-bold">接入真实大模型 <span className="text-body font-normal text-ink3">真实试调通过才会保存；保存即全链生效，无需重启</span></div>
+            <div className="break-words text-sm font-bold">接入真实大模型</div>
+            {st?.llm.provider === "codex" ? (
+              <div className="space-y-3">
+                <p className="break-words text-body text-ink3">OpenAI Responses · {st.llm.model}</p>
+                <p className="break-words text-body text-ink3">
+                  {st.llm.real ? "验证会通过当前进程的配置发送一次模型请求。"
+                    : "请由实例所有者配置 OPENAI_API_KEY 并重新启动运行时。"}
+                </p>
+                <button className={btnCls} disabled={saving || !st.llm.real} onClick={() => void saveLlm()}>
+                  {saving ? "验证中……" : "验证并继续 →"}
+                </button>
+              </div>
+            ) : <>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {PROVIDERS.map((p) => (
                 <button key={p.key} onClick={() => pickProvider(p.key)}
@@ -460,6 +478,7 @@ export default function Onboarding() {
                 </button>
               </div>
             </div>
+            </>}
           </div>
         )}
 

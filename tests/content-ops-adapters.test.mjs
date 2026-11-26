@@ -36,11 +36,14 @@ test('fixed adapter bindings include actual full supporting source bytes and nev
   assert.equal(bindings.length, 17); assert.ok(bindings.some(binding => binding.kind === 'format.transform'));
   for (const name of ['worker.mjs', 'model.mjs', 'transport.mjs', 'renderers.mjs', 'media.mjs']) assert.ok(closure.files.some(file => file.path.endsWith(name)));
   assert.ok(closure.files.some(file => file.path === 'scripts/content-ops-worker.mjs'));
+  assert.ok(closure.files.some(file => file.path === 'src/model-routing/codex.mjs'));
+  assert.ok(closure.files.some(file => file.path === 'src/model-routing/codex-pricing.mjs'));
   assert.ok(closure.files.some(file => file.path === 'engines/video-edit/packages/base/model-router/deepseek-window.mjs'));
   assert.ok(closure.files.some(file => file.path === 'engines/video-edit/packages/base/model-router/assets/deepseek-v4-tokenizer.json'));
   for (const file of closure.files) assert.equal(bytesHash(fs.readFileSync(path.join(ROOT, file.path))), file.sha256);
   assert.ok(bindings.every(binding => binding.entrypointSha === closure.sha256));
   assert.equal(bindings.find(binding => binding.kind === 'video.assemble').fixedTransport, 'fixed_native_local');
+  assert.equal(bindings.find(binding => binding.kind === 'quality.final').fixedTransport, 'single_openai_responses');
 });
 test('a running ESM worker cannot advertise a new disk fingerprint while still holding cached older code', async t => {
   const copy = rootDirectory(t), closure = await contentOpsSourceClosure();

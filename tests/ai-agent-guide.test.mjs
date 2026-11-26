@@ -37,6 +37,8 @@ test('guide contains complete current documents and exact byte hashes without ru
   const directory = await temporary(t), dataDir = path.join(directory, 'uncreated runtime');
   const guide = readAiAgentGuide({ rootDir: root, dataDir });
   assert.equal(guide.productId, 'pengmanager-system');
+  assert.equal(guide.productName, '鹏经理Codex版');
+  assert.ok(guide.support.editorial.job.includes('pengmanager.editorial.job.dispatch'));
   assert.equal(guide.support.shellRequiredForProduction, true);
   assert.equal(guide.support.pureMcpProductionSupported, false);
   assert.equal(guide.providerCallsPerformed, false);

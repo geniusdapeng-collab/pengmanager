@@ -31,6 +31,7 @@ import {
   resolveVideoApiKey,
   resolveVideoModel,
 } from "../../packages/video-studio/src/llm-config.js";
+import { CodexTextProvider, usesCodexText } from "../../packages/base/model-router/codex-provider.js";
 import { OpenAiCompatibleProvider } from "../../packages/base/model-router/providers.js";
 
 function arg(name: string, fallback = ""): string {
@@ -92,10 +93,12 @@ if (flag("--llm")) {
   const baseUrl = resolveOpenAiCompatibleBaseUrl(combined) || "https://api.deepseek.com";
   const model = resolveVideoModel(combined) || "deepseek-flash";
   if (!key) {
-    throw new Error(`--llm 已启用，但 ${envFile} 与当前进程都没有 DEEPSEEK_API_KEY；拒绝静默退回规则`);
+    throw new Error(usesCodexText(combined) ? "--llm 需要 Codex 版的 OPENAI_API_KEY"
+      : `--llm 已启用，但 ${envFile} 与当前进程都没有 DEEPSEEK_API_KEY；拒绝静默退回规则`);
   } else {
     llmNote = `已启用（${model}）`;
-    const provider = new OpenAiCompatibleProvider(model, { baseUrl, apiKey: key });
+    const provider = usesCodexText(combined) ? new CodexTextProvider({ model, env: combined })
+      : new OpenAiCompatibleProvider(model, { baseUrl, apiKey: key });
     llmCall = async (prompt: string): Promise<string> => {
       const result = await provider.chat(
         [{ role: "user", content: prompt }],

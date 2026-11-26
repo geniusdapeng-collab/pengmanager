@@ -50,7 +50,7 @@ export interface ChatResult {
   responseId: string | null;
   scene: string;
   mode: "enabled" | "disabled";
-  effort?: ThinkingEffort;
+  effort?: ThinkingEffort | "medium" | "xhigh";
   outputCeiling: number;
   inputTokenEstimate: number;
   inputTokenUpperBound?: number;

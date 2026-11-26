@@ -10,30 +10,33 @@ function messages(system, input) {
 
 function receipt(result) {
   return {
+    provider: result.receipt?.registry?.provider ?? null,
     requestedModel: result.requestedModel,
     resolvedModel: result.resolvedModel,
     responseId: result.responseId,
     requestHash: result.requestHash,
     responseHash: result.responseHash,
+    wireSha256: result.wireSha256 ?? null,
     finishReason: result.finishReason,
     usage: result.usage,
     policyHash: result.policyHash,
     registryVersion: result.registryVersion,
     attempts: result.attempts ?? [],
+    budget: result.receipt?.budget ?? null,
     policy: result.receipt?.policy ?? null,
   };
 }
 
 export class ContentDirectorModel {
-  constructor({ deepSeek } = {}) {
-    if (!deepSeek || typeof deepSeek.completeTask !== "function") {
+  constructor({ model } = {}) {
+    this.model = model;
+    if (!this.model || typeof this.model.completeTask !== "function") {
       throw new ApiError(500, "CONTENT_MODEL_UNAVAILABLE", "内容总控模型适配器未配置。");
     }
-    this.deepSeek = deepSeek;
   }
 
   async #json(scene, system, input) {
-    const result = await this.deepSeek.completeTask({ scene, messages: messages(system, input) });
+    const result = await this.model.completeTask({ scene, messages: messages(system, input) });
     if (!result.value || typeof result.value !== "object" || Array.isArray(result.value)) {
       throw new ApiError(502, "CONTENT_MODEL_OUTPUT_INVALID", "模型未返回结构化对象。");
     }
@@ -105,9 +108,9 @@ export class ContentDirectorModel {
   }
 
   async search(query, { count = 5 } = {}) {
-    if (typeof this.deepSeek.search !== "function") {
+    if (typeof this.model.search !== "function") {
       throw new ApiError(503, "CONTENT_RESEARCH_UNAVAILABLE", "当前模型适配器不支持联网研究。");
     }
-    return this.deepSeek.search(query, { count });
+    return this.model.search(query, { count });
   }
 }

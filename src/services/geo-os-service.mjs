@@ -118,7 +118,7 @@ export class GeoOsService {
     return {
       schemaVersion: state.schemaVersion,
       revision: state.revision,
-      system: state.system ?? { ...SYSTEM_IDENTITY },
+      system: { ...state.system, ...SYSTEM_IDENTITY },
       entity: state.entity,
       accounts: state.accounts,
       claims: state.claims,
@@ -591,7 +591,7 @@ export class GeoOsService {
           priority: ["P0", "P1", "P2"].includes(input.priority) ? input.priority : "P1",
           surfaces: Array.isArray(input.surfaces) && input.surfaces.length
             ? input.surfaces.map(String)
-            : ["DeepSeek Search"],
+            : ["Codex Search"],
           state: "approved",
           createdAt: this.clock().toISOString(),
         };
@@ -709,7 +709,7 @@ export class GeoOsService {
       .filter(Boolean);
     return {
       generatedAt: this.clock().toISOString(),
-      system: state.system ?? { ...SYSTEM_IDENTITY },
+      system: { ...state.system, ...SYSTEM_IDENTITY },
       entity: {
         publicName: state.entity.publicName,
         brandName: state.entity.brandName,

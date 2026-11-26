@@ -4,7 +4,7 @@ import { JsonStore } from "../src/storage/json-store.mjs";
 import { loadSeedState } from "../src/services/bootstrap.mjs";
 import { GeoOsService } from "../src/services/geo-os-service.mjs";
 import { LivePipelineService } from "../src/services/live-pipeline.mjs";
-import { DeepSeekAdapter } from "../src/adapters/deepseek.mjs";
+import { CodexAdapter } from "../src/adapters/codex.mjs";
 import { GitHubAdapter } from "../src/adapters/github.mjs";
 import { VideoEditAdapter } from "../src/adapters/video-edit.mjs";
 import { PersonalGeoEngine } from "../src/engines/geo-evidence.mjs";
@@ -17,14 +17,16 @@ const store = new JsonStore({ filePath: stateFile });
 await store.open(() => loadSeedState(dataDir));
 const service = new GeoOsService({ store });
 const controlQueries = store.snapshot().queries;
+const claimIds = ["C001"];
 const geoEngine = new PersonalGeoEngine({
   rootDir,
+  databasePath: join(rootDir, "var", "live-full-system-geo.sqlite"),
   controlQueries,
 });
 const mediaEngine = new VideoMediaEngine({ rootDir });
 const live = new LivePipelineService({
   service,
-  deepSeek: new DeepSeekAdapter(),
+  model: new CodexAdapter(),
   github: new GitHubAdapter(),
   geoEngine,
   videoEdit: new VideoEditAdapter({
@@ -34,7 +36,7 @@ const live = new LivePipelineService({
 });
 
 try {
-  for (const claimId of ["C003", "C005"]) {
+  for (const claimId of claimIds) {
     const claim = store.snapshot().claims.find((item) => item.id === claimId);
     if (claim?.state !== "approved") {
       await service.approveClaim(claimId, {
@@ -47,7 +49,7 @@ try {
   const generated = await live.generateContent({
     brief:
       "生成一条 30 秒以内的专业短视频文案：解释个人 GEO 为什么需要 Claim、证据、审批、发布回执和复测。",
-    claimIds: ["C003", "C005"],
+    claimIds,
     platform: "微信视频号",
     contentType: "video",
   });
@@ -121,13 +123,13 @@ try {
       revision: service.store.snapshot().revision,
     },
   };
-  const receiptDir = join(rootDir, "docs", "evidence");
-  await mkdir(receiptDir, { recursive: true });
-  const receiptPath = join(receiptDir, `full-system-live-${date}.json`);
+  const receiptDir = join(rootDir, "var", "receipts");
+  await mkdir(receiptDir, { recursive: true, mode: 0o700 });
+  const receiptPath = join(receiptDir, `full-system-live-${date}-${media.jobId}.json`);
   await writeFile(
     receiptPath,
     `${JSON.stringify(receipt, null, 2)}\n`,
-    "utf8",
+    { encoding: "utf8", mode: 0o600 },
   );
   console.log(JSON.stringify(receipt, null, 2));
 } finally {

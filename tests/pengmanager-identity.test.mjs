@@ -146,6 +146,6 @@ test("content generation uses bilingual PengManager profile in the provider prom
   await adapter.generateContent({ brief: "测试", claims: [{ id: "C001", text: MAIN_PROFILE.headline }], platform: "GitHub" });
   assert.ok(prompt.includes(MAIN_PROFILE.displayNameZh));
   assert.ok(prompt.includes(MAIN_PROFILE.bioEn));
-  assert.ok(prompt.includes("鹏经理系统 / PengManager System"));
+  assert.ok(prompt.includes(`${SYSTEM_IDENTITY.nameZh} / ${SYSTEM_IDENTITY.nameEn}`));
   assert.ok(!prompt.includes("PengStack"));
 });

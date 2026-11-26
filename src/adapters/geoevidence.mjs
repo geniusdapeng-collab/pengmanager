@@ -81,10 +81,10 @@ export class GeoEvidenceAdapter {
   }
 
   async runVisibility({
-    provider = "deepseek-search",
+    provider = "codex-search",
     limit = 1,
     queryId,
-    platform = "deepseek",
+    platform = "codex",
   } = {}) {
     const body = await requestJson(
       this.fetchImpl,
@@ -100,6 +100,7 @@ export class GeoEvidenceAdapter {
             limit,
             ...(queryId ? { queryId } : {}),
             platform,
+            confirm: true,
           },
           scope: {
             tenantId: "personal-pengstack",
@@ -110,7 +111,8 @@ export class GeoEvidenceAdapter {
       },
       this.token,
     );
-    if (body?.receipt?.synced !== true || body?.result?.successful < 1) {
+    if (body?.receipt?.synced !== true || !Number.isSafeInteger(body?.result?.successful)
+      || body.result.successful < 1 || body.result.provider !== provider) {
       throw new Error("GeoEvidence 未返回成功同步回执，拒绝标记完成。");
     }
     return {

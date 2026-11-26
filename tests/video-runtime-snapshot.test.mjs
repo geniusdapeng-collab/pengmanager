@@ -64,3 +64,18 @@ test('public engine inventory verifies its selected files without accepting an i
   fs.unlinkSync(path.join(engineRoot, 'entry.mjs'));
   assert.throws(verifyPublic, { code: 'COMPLETE_ENGINE_MISSING' });
 });
+
+test('the shipped source tree satisfies its own native engine pin', () => {
+  const rootDir = path.resolve(import.meta.dirname, '..');
+  const pin = JSON.parse(fs.readFileSync(path.join(rootDir, 'upstreams', 'workloom-video-edit.pin.json')));
+  const receipt = verifyPinnedSnapshot({
+    rootDir,
+    engineRoot: path.join(rootDir, pin.engineRoot),
+    commit: pin.commit,
+    fileCount: pin.sourceFileCount,
+    expectedSha256: pin.snapshotSha256,
+    distribution: pin.distribution,
+  });
+  assert.equal(receipt.fileCount + receipt.omittedSourceFileCount, pin.sourceFileCount);
+  assert.equal(receipt.totalFiles, receipt.fileCount + receipt.targetOwnedFileCount);
+});

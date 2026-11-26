@@ -4,7 +4,7 @@ import os from 'node:os';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { MODEL_POLICY } from '../model-routing/policy.mjs';
-import { DEEPSEEK_FLASH_MODEL_ID, normalizeTextModelId } from '../model-routing/registry.mjs';
+import { codexTextRegistration } from '../model-routing/codex.mjs';
 
 export const SOURCE_MAIN = 'a544ab8b068790bfb14b7977efc81b33897fc9de';
 export const SOURCE_FILE_COUNT = 3650;
@@ -173,20 +173,15 @@ export function acquireLock(config) {
   };
 }
 export function textModelReadiness(env) {
-  const provider = String(env.LLM_PROVIDER || (env.LLM_API_KEY || env.DEEPSEEK_API_KEY ? 'deepseek' : 'mock')).trim();
-  const baseUrl = env.LLM_BASE_URL || env.DEEPSEEK_BASE_URL;
-  const apiKey = env.LLM_API_KEY || env.DEEPSEEK_API_KEY;
-  const configuredModel = env.LLM_MODEL || env.DEEPSEEK_MODEL || DEEPSEEK_FLASH_MODEL_ID;
   const missing = [];
-  if (provider !== 'deepseek') missing.push('real-deepseek-text-model-provider');
-  if (!String(baseUrl || '').trim()) missing.push('LLM_BASE_URL');
-  if (!String(apiKey || '').trim()) missing.push('LLM_API_KEY');
-  let model = null;
-  try { model = normalizeTextModelId(configuredModel); }
-  catch { missing.push('registered-text-model'); }
+  let registration;
+  try { registration = codexTextRegistration({ env }); }
+  catch { missing.push('registered-codex-text-model'); }
+  if (!env.OPENAI_API_KEY?.trim()) missing.push('OPENAI_API_KEY');
   return {
-    provider,
-    model,
+    provider: 'codex',
+    model: registration?.officialModelId ?? null,
+    baseUrl: registration?.baseUrl ?? '',
     configured: missing.length === 0,
     missing,
     policyVersion: MODEL_POLICY.policyVersion,

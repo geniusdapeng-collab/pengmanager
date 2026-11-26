@@ -531,19 +531,22 @@ export class ContentDirectorService {
     }
   }
 
-  async createJob(input, ctx, { internalBatchId = null } = {}) {
+  async createJob(input, ctx, { internalBatchId = null, agentDispatchRequired = false } = {}) {
     const actor = assertionAdmin(ctx);
     if (this.mode !== "enabled") fail(409, "CONTENT_DIRECTOR_READ_ONLY", "当前功能处于 shadow 或 disabled 模式，只允许路由观测。");
     if (!input || typeof input !== "object" || Array.isArray(input)) fail(400, "CONTENT_DIRECTOR_INPUT_INVALID", "任务输入必须是对象。");
     const state = this.state();
     const attachments = this.#resolveAttachmentInput(input.attachments, state);
-    const route = await this.resolveIntent({ ...input, attachments });
+    const route = await this.resolveIntent({ ...input, attachments, ...(agentDispatchRequired ? { useModel: false } : {}) });
     if (!route.artifactKind) fail(422, "CONTENT_INTENT_CLARIFICATION_REQUIRED", route.clarifyQuestion ?? "需要明确内容类型。", { route });
+    if (agentDispatchRequired && route.artifactKind.startsWith("video_")) {
+      fail(422, "EDITORIAL_VIDEO_USE_NATIVE", "视频生产使用原生工作台及标准 CLI。");
+    }
     const claimIds = stringList(input.claimIds, "claimIds", 100);
     claimRows(state, claimIds);
     const normalized = normalizeJobInput(route, { ...input, attachments }, claimIds);
     const attachmentBindings = this.#attachmentBindings(normalized.attachments, state);
-    const outcome = await this.#write("job_created", input, ctx, (next, { actor: writeActor, now, payload }) => {
+    const outcome = await this.#write(agentDispatchRequired ? "agent_draft_created" : "job_created", input, ctx, (next, { actor: writeActor, now, payload }) => {
       for (const id of claimIds) {
         const claim = next.claims.find(row => row.id === id);
         if (!claim || claim.state !== "approved") fail(409, "CLAIM_CHANGED", "创建任务期间 Claim 状态已变化。");
@@ -599,6 +602,7 @@ export class ContentDirectorService {
         pipeline: route.pipeline,
         route,
         input: normalized,
+        ...(agentDispatchRequired ? { agentDispatchRequired: true } : {}),
         status: route.missing.length ? "needs_input" : "queued",
         revision: 1,
         stepRefs: [routeStep.id, ...(attachmentStep ? [attachmentStep.id] : [])],
@@ -1029,12 +1033,42 @@ export class ContentDirectorService {
       row.status = "queued";
       row.error = null;
       row.pauseRequested = false;
+      delete row.agentDispatchRequired;
       row.revision += 1;
       row.updatedAt = this.clock().toISOString();
       return row;
     });
     if (this.autoStart) this.#schedule(id);
     return this.getJob(id);
+  }
+
+  async dispatchAgentJob(id, input, ctx) {
+    assertionAdmin(ctx);
+    this.state();
+    if (this.mode !== "enabled" || !this.autoStart) fail(409, "EDITORIAL_DISPATCH_DISABLED", "此实例未启用图文任务执行。");
+    if (input?.confirmProduction !== true) fail(422, "EDITORIAL_DISPATCH_CONFIRMATION_REQUIRED", "启动图文生产前需要本次模型和素材授权。");
+    const accepted = await this.#write(`agent_job_dispatched:${id}`, { ifMatch: ctx.ifMatch ?? null }, ctx, (state, { now }) => {
+      const current = state.contentDirectorJobs.find(row => row.id === id);
+      if (!current) fail(404, "CONTENT_JOB_NOT_FOUND", "找不到内容 Job。");
+      assertJobVersion(current, ctx.ifMatch);
+      if (current.artifactKind.startsWith("video_") || current.agentDispatchRequired === undefined) {
+        fail(409, "EDITORIAL_JOB_SCOPE_DENIED", "此入口仅可启动或续办已登记的图文 Agent 任务。");
+      }
+      if (current.missing.length) fail(409, "CONTENT_JOB_NEEDS_INPUT", "任务仍缺少必要输入。", { missing: current.missing });
+      if (!(current.agentDispatchRequired && current.status === "queued") && !["needs_resume", "blocked", "failed"].includes(current.status)) {
+        fail(409, "CONTENT_JOB_NOT_STARTABLE", `当前状态 ${current.status} 不能启动。`);
+      }
+      current.agentDispatchRequired = false;
+      current.status = "queued";
+      current.pauseRequested = false;
+      current.error = null;
+      current.revision += 1;
+      current.updatedAt = now.toISOString();
+      return { jobId: id, revision: current.revision };
+    });
+    const current = await this.getJob(accepted.jobId);
+    if (current.revision === accepted.revision && current.status === "queued" && !current.pauseRequested) this.#schedule(id);
+    return current;
   }
 
   async processJob(id) {
@@ -1045,7 +1079,7 @@ export class ContentDirectorService {
     const state = this.state();
     const job = state.contentDirectorJobs.find(row => row.id === id);
     if (!job) fail(404, "CONTENT_JOB_NOT_FOUND", "找不到内容 Job。");
-    if (!["queued", "needs_resume", "running"].includes(job.status)) return this.getJob(id);
+    if (job.agentDispatchRequired || !["queued", "needs_resume", "running"].includes(job.status)) return this.getJob(id);
     this.#running.add(id);
     try {
       if (job.status !== "running") {
@@ -1072,7 +1106,7 @@ export class ContentDirectorService {
     try {
       const job = this.state().contentDirectorJobs.find(row => row.id === id);
       if (!job) fail(404, "CONTENT_JOB_NOT_FOUND", "找不到内容 Job。");
-      if (!["running", "queued", "needs_resume"].includes(job.status)) return this.getJob(id);
+      if (job.agentDispatchRequired || !["running", "queued", "needs_resume"].includes(job.status)) return this.getJob(id);
       await this.#assertLive(id);
       if (job.artifactKind === "article" || job.artifactKind === "article_visual") {
         await this.#processArticle(id);
@@ -1794,7 +1828,7 @@ export class ContentDirectorService {
     this.#draining = Promise.resolve().then(() => this.#drain()).finally(() => {
       this.#draining = null;
       try {
-        const queued = this.store.snapshot().contentDirectorJobs.some(job => job.status === "queued" && !job.pauseRequested && !this.#running.has(job.id));
+        const queued = this.store.snapshot().contentDirectorJobs.some(job => job.status === "queued" && !job.pauseRequested && !job.agentDispatchRequired && !this.#running.has(job.id));
         if (queued && this.#running.size < MAX_JOBS_RUNNING) this.#scheduleDrain();
       } catch (error) {
         if (error?.code !== "STATE_STORE_CLOSED") this.#schedulerError = error;
@@ -1806,7 +1840,7 @@ export class ContentDirectorService {
     while (this.#running.size < MAX_JOBS_RUNNING) {
       const state = this.state();
       const candidate = [...state.contentDirectorJobs]
-        .filter(job => job.status === "queued" && !job.pauseRequested && !this.#running.has(job.id))
+        .filter(job => job.status === "queued" && !job.pauseRequested && !job.agentDispatchRequired && !this.#running.has(job.id))
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
       if (!candidate) return;
       this.#scheduled.delete(candidate.id);
@@ -1818,7 +1852,7 @@ export class ContentDirectorService {
           payload: { jobId: candidate.id },
         }, next => {
           const row = next.contentDirectorJobs.find(item => item.id === candidate.id);
-          if (!row || row.status !== "queued" || row.pauseRequested) return JsonStore.noChange(row);
+          if (!row || row.status !== "queued" || row.pauseRequested || row.agentDispatchRequired) return JsonStore.noChange(row);
           row.status = "running";
           row.revision += 1;
           row.updatedAt = this.clock().toISOString();

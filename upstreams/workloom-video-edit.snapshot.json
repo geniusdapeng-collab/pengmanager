@@ -699,7 +699,7 @@
     {
       "path": "apps/server/src/trpc/router.ts",
       "mode": "100644",
-      "targetSha256": "e6c52188aaab3dd93add44e77c90de902e58c23911041b0063d5c18244184912"
+      "targetSha256": "08a1d73e9e37fc3fe50f7872053606f3bf1ffbbce1212f551b2b8806c7990106"
     },
     {
       "path": "apps/server/src/video/accounting.ts",
@@ -1559,7 +1559,7 @@
     {
       "path": "apps/web/src/components/SimBanner.tsx",
       "mode": "100644",
-      "targetSha256": "cf7d386642547071442b62504ecef388c716e0df96e8bf862d0df47e0956bdce"
+      "targetSha256": "0ed2ae3a6d8a73216d8bacc788cee54d71359a231de60fe6d1af0bf841fb178f"
     },
     {
       "path": "apps/web/src/components/SkillDistBanner.tsx",
@@ -2164,7 +2164,7 @@
     {
       "path": "apps/web/src/pages/onboarding/Onboarding.tsx",
       "mode": "100644",
-      "targetSha256": "71568bc720256d6390387807ff347c6606a159a47832e529e9b4c3dd1d4ee63b"
+      "targetSha256": "7ddce050af627a064ef5f700e4327e6fd466ae76612faf0fff147409e97b5933"
     },
     {
       "path": "apps/web/src/pages/onboarding/systemText.test.ts",
@@ -8519,7 +8519,7 @@
     {
       "path": "packages/base/model-router/index.ts",
       "mode": "100644",
-      "targetSha256": "71464ee5c55a02651ca8cf0ea401c60474bc84e4f1a16fe0bffeae29f88c6047"
+      "targetSha256": "5fece01e91a106408623004ed137253f6b126d41769d19f9c4469a92288dd8bf"
     },
     {
       "path": "packages/base/model-router/model-router.test.ts",
@@ -8539,7 +8539,7 @@
     {
       "path": "packages/base/model-router/pool.ts",
       "mode": "100644",
-      "targetSha256": "ae5d14644544c5276344a8121ffb0e05a1431f1502b79af113c2e7d2fb58c4db"
+      "targetSha256": "cede8868716568ddad87ebf5b2b7aee00fc97f8ad584f0f8c3e6256a57d87fed"
     },
     {
       "path": "packages/base/model-router/providers-options.test.ts",
@@ -8549,7 +8549,7 @@
     {
       "path": "packages/base/model-router/providers.ts",
       "mode": "100644",
-      "targetSha256": "9f97991305adf80c84a09a6a2c25ec0170818dca3ca9acbddc04297872455afb"
+      "targetSha256": "2d80dc653d27550ed15ebd75f3289903907353c97cd4eb69678dd1d53dd63bfe"
     },
     {
       "path": "packages/base/model-router/router-generation.test.ts",
@@ -8574,7 +8574,7 @@
     {
       "path": "packages/base/model-router/router.ts",
       "mode": "100644",
-      "targetSha256": "7717d2b3a3eb7e9c49ca942de32a0a5b05a984ebc236f4dec6062c720d5f1923"
+      "targetSha256": "047712fc838d9224bbf2c1537b3f84fb2fe2feaf20ad73b735d6fba9fda10326"
     },
     {
       "path": "packages/base/model-router/sink.ts",
@@ -10544,7 +10544,7 @@
     {
       "path": "packages/video-studio/src/llm-adapter.ts",
       "mode": "100644",
-      "targetSha256": "56cee08f3c453dbbda7ea2e36eada8946e4d135017708507551ec4f848c3e101"
+      "targetSha256": "07aecd1366cd21e6cc5dade48f58b547110597ec3d65d8a68927847c23f718dd"
     },
     {
       "path": "packages/video-studio/src/llm-config.test.ts",
@@ -10554,7 +10554,7 @@
     {
       "path": "packages/video-studio/src/llm-config.ts",
       "mode": "100644",
-      "targetSha256": "ef482a3bdffceca77a0f2fcec1b83b75a79b49c2c554eab19dda18b013a46c78"
+      "targetSha256": "e315d494c897a38999cffe08d682efdc198332671ea56791997f2afea5943225"
     },
     {
       "path": "packages/video-studio/src/marketing-prd-contract.test.ts",
@@ -10674,7 +10674,7 @@
     {
       "path": "packages/video-studio/src/plausibility-review.ts",
       "mode": "100644",
-      "targetSha256": "d837584a553ac908d555a5e36af6b10ef1a5363751e390e1766d70ff6ac8b358"
+      "targetSha256": "7bf7f7a41cf3b9d571901df9ae49fe129bf9e2a9ae81d69deb32960e2f375158"
     },
     {
       "path": "packages/video-studio/src/portrait-agent.test.ts",
@@ -10774,7 +10774,7 @@
     {
       "path": "packages/video-studio/src/producer-gate.ts",
       "mode": "100644",
-      "targetSha256": "146bd47fb5b49a077ea534282141dee485fb516fe387e906cf2bd1ef64822c75"
+      "targetSha256": "342691f7f7513616e087f429e66c34a6f3f3f3214f1426946582b9acb57b681a"
     },
     {
       "path": "packages/video-studio/src/product-archive.multitype.test.ts",
@@ -12534,7 +12534,7 @@
     {
       "path": "scripts/tools/explainer-run.mts",
       "mode": "100644",
-      "targetSha256": "0162d8272c518184e38bccd2cebeab02c739ff6f8a1911ad2a3b587b54bb4b13"
+      "targetSha256": "9c2009ffd3d36b7f5eaf57d9279daa702858104fe0cfb827765d6b509e343e7b"
     },
     {
       "path": "scripts/tools/fence-alias-scan.mts",
@@ -12699,12 +12699,12 @@
     {
       "path": "scripts/tools/portrait-agent.mts",
       "mode": "100644",
-      "targetSha256": "f80f0dea455738d204a52fcf15fa795b70726c32b040e1d590e8e2689534bf67"
+      "targetSha256": "abdaf9efec6e569f2b068910f181f646a2a4d9bf0683f01c997541b9f115fa46"
     },
     {
       "path": "scripts/tools/portrait-set-from-asset.mts",
       "mode": "100644",
-      "targetSha256": "67ef3a6c637df800adde67cb8afcf16ed9a1ef0dbaaf31e2267cbc519ec04b90"
+      "targetSha256": "3a601a590ff3b537dfef2d330d8c3ed8d748792449852ba98cbfcbd3e27ecc1c"
     },
     {
       "path": "scripts/tools/portrait-set-install.mts",
@@ -12769,7 +12769,7 @@
     {
       "path": "scripts/tools/route-video.mts",
       "mode": "100644",
-      "targetSha256": "d67728a426d48eb6bf6f82f3d84896c5582fc379a62d93b24b0d691eb0c47d0d"
+      "targetSha256": "d09c448e5829a3c585c4a493f645b02ebdeb0faba73e4d3e39a4fb1f3a79504b"
     },
     {
       "path": "scripts/tools/run-data-pipeline-stress.mjs",
@@ -16256,12 +16256,12 @@
     {
       "path": "apps/server/src/video/creative-config.test.ts",
       "mode": "100644",
-      "targetSha256": "10ba57a9b80655533cd4003eb967828e37fbde7a80ac626ebb24e8b5918e0a79"
+      "targetSha256": "f20c3875cd3c7978aec3ddcc954e7a8f8b49cbbbaa06c27e2065c444277cba70"
     },
     {
       "path": "apps/server/src/video/creative-config.ts",
       "mode": "100644",
-      "targetSha256": "5f5df63aeca05dbadf1d7b08270228bc2f83b48331ba0dc47ad6225460810624"
+      "targetSha256": "7312fc29de0b75dee338e00b3dd76a3981dde1ad93f8f0276147dd17a7f0cd69"
     },
     {
       "path": "apps/server/src/video/creative-evaluation-matrix.pg.test.ts",
@@ -16296,7 +16296,7 @@
     {
       "path": "apps/server/src/video/creative-service.ts",
       "mode": "100644",
-      "targetSha256": "37095e789029de6698c25c2be25b273f00715e04a21c857441e2369e6495a7b0"
+      "targetSha256": "3063340672a7b266504c83ea080972247ecd43081eff126eed39fbad02bc1024"
     },
     {
       "path": "apps/server/src/video/creative-shadow.test.ts",
@@ -16454,6 +16454,11 @@
       "targetSha256": "1c8f573e830ca9b3ebfeb7ace1823146e22b66f99ee223840e7637c9e745e1c7"
     },
     {
+      "path": "packages/base/model-router/codex-provider.ts",
+      "mode": "100644",
+      "targetSha256": "734277204c61c7b27c40751466490f7139da46f719c2d6138b1059ade8846cab"
+    },
+    {
       "path": "packages/base/model-router/deepseek-window.d.mts",
       "mode": "100644",
       "targetSha256": "2ac1a990a4fd88a3903fdd6663a0017a1c7d34a29c245a5de7f5d24993b3e69b"
@@ -16522,6 +16527,16 @@
       "path": "packages/video-studio/src/builtin-character-selection.ts",
       "mode": "100644",
       "targetSha256": "727643188119a1cc86d119d7eba016bd5b9cf73957782318b1f991439102094d"
+    },
+    {
+      "path": "packages/video-studio/src/codex-budget.ts",
+      "mode": "100644",
+      "targetSha256": "e7d30a4a361dafe69536ac7ce9fcfcb86778009352c56b05b97fd2a5d8bfa3ad"
+    },
+    {
+      "path": "packages/video-studio/src/codex-video.test.ts",
+      "mode": "100644",
+      "targetSha256": "9aeed842a4859eb622dc7bef854e546bcb7f79208683802488aee429a1ccbbc8"
     },
     {
       "path": "packages/video-studio/src/constraint-compiler.test.ts",
@@ -16651,7 +16666,7 @@
     {
       "path": "packages/video-studio/src/video-text-client.ts",
       "mode": "100644",
-      "targetSha256": "3c87d245ab22bdde93f68197b5c7eb4ebec7fda88ae2323b6fdba493fdaf3dae"
+      "targetSha256": "e26f8d5613eccc7bb29faea5016cbac43a6a7b7fc77af839bfa4799bb2f07d47"
     },
     {
       "path": "pengmanager-capabilities.json",

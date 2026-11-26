@@ -224,9 +224,9 @@ test("live adapter routes require explicit confirmation", async () => {
   let called = 0;
   const livePipeline = {
     async adapterHealth() {
-      return { deepSeek: { ok: true } };
+      return { textModel: { ok: true } };
     },
-    async collectDeepSeek() {
+    async collectCodex() {
       called += 1;
       return { successful: 1 };
     },
@@ -240,7 +240,7 @@ test("live adapter routes require explicit confirmation", async () => {
     const health = await request(baseUrl, "/api/adapters/health");
     assert.equal(health.response.status, 200);
 
-    const missingConfirmation = await request(baseUrl, "/api/live/deepseek/collect", {
+    const missingConfirmation = await request(baseUrl, "/api/live/codex/collect", {
       method: "POST",
       body: JSON.stringify({ limit: 1 }),
     });
@@ -250,11 +250,17 @@ test("live adapter routes require explicit confirmation", async () => {
       "LIVE_RUN_CONFIRMATION_REQUIRED",
     );
 
-    const confirmed = await request(baseUrl, "/api/live/deepseek/collect", {
+    const confirmed = await request(baseUrl, "/api/live/codex/collect", {
       method: "POST",
       body: JSON.stringify({ confirm: true, limit: 1 }),
     });
     assert.equal(confirmed.response.status, 200);
+    const retired = await request(baseUrl, "/api/live/deepseek/collect", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, limit: 1 }),
+    });
+    assert.equal(retired.response.status, 410);
+    assert.equal(retired.payload.error.code, "GEO_PROVIDER_RETIRED");
     assert.equal(called, 1);
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));

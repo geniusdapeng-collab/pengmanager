@@ -46,6 +46,8 @@ import {
   resolveVideoModel,
 } from "./llm-config.js";
 import {
+  CodexTextProvider,
+  usesCodexText,
   OpenAiCompatibleProvider,
   type ChatResult,
   type ModelContentPart,
@@ -55,6 +57,7 @@ import { normalizeShotIntent, shotIntentHash, type ShotIntentStatus } from "./sh
 import { devicePolicyPromptLines } from "./device-policy.js";
 import { environmentDefects, expandShotWithBible, environmentProfilePromptLines, propInteractionPromptLines, type SceneBible } from "./scene-bible.js";
 import { resolveEraProfile, type EraProfile } from "./era-profile.js";
+import { budgetCodexProvider } from "./codex-budget.js";
 import { creativeBudgetActive, creativeBudgetedFetch, creativeExecutionSignal } from "./creative-runtime.js";
 
 export interface DeterministicCheck {
@@ -266,6 +269,7 @@ interface LlmConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  codexEnv?: NodeJS.ProcessEnv;
 }
 
 /** 解析评审模型（与 model-router 的 LLM_* 口径一致，兼容 DEEPSEEK_* 秘密文件） */
@@ -274,7 +278,7 @@ export function resolveProducerLlm(env: Record<string, string | undefined> = pro
   const apiKey = resolveVideoApiKey(env);
   const model = resolveVideoModel(env);
   if (!baseUrl || !apiKey || !model) return null;
-  return { baseUrl, apiKey, model };
+  return usesCodexText(env) ? { baseUrl, apiKey: "", model, codexEnv: env } : { baseUrl, apiKey, model };
 }
 
 function summarizeArtifacts(artifacts: ProducerArtifact[]): string {
@@ -427,7 +431,8 @@ export async function reviewStage(options: ProducerGateOptions): Promise<Produce
   const minScore = options.minScore ?? 70;
   if (!Number.isFinite(minScore) || minScore < 0 || minScore > 100) return reject("评审分数阈值非法");
   const exactQualification = options.allowExactQualificationImages === true && stage === "prompt"
-    && llm.model === DEEPSEEK_FLASH_MODEL && /^https:\/\/api\.deepseek\.com(?:\/v1)?$/u.test(llm.baseUrl);
+    && (llm.codexEnv !== undefined
+      || (llm.model === DEEPSEEK_FLASH_MODEL && /^https:\/\/api\.deepseek\.com(?:\/v1)?$/u.test(llm.baseUrl)));
   const tempPaths: string[] = [];
   const textContent: ModelContentPart[] = [];
   const encoded: ModelContentPart[][] = [];
@@ -532,14 +537,19 @@ export async function reviewStage(options: ProducerGateOptions): Promise<Produce
       return fetchImpl(url, init);
     } : fetchImpl;
     const budgetedFetch = budgeted ? creativeBudgetedFetch(reviewFetch) : undefined;
-    const provider = new OpenAiCompatibleProvider(llm.model, {
-      baseUrl: llm.baseUrl,
-      apiKey: llm.apiKey,
-      fetchImpl: budgetedFetch ? async (input, init) => {
-        try { return await budgetedFetch(input, init); }
-        catch (error) { budgetFailure = error; throw error; }
-      } : reviewFetch,
-    });
+    const provider = llm.codexEnv
+      ? budgetCodexProvider(new CodexTextProvider({
+        env: llm.codexEnv, model: llm.model, fetchImpl: options.fetchImpl,
+        maxRequestBytes: exactQualification ? QUALIFICATION_JUDGE_WIRE_BYTES : undefined,
+      }))
+      : new OpenAiCompatibleProvider(llm.model, {
+        baseUrl: llm.baseUrl,
+        apiKey: llm.apiKey,
+        fetchImpl: budgetedFetch ? async (input, init) => {
+          try { return await budgetedFetch(input, init); }
+          catch (error) { budgetFailure = error; throw error; }
+        } : reviewFetch,
+      });
     for (let batch = 0; batch < batches; batch += 1) {
       const content: ModelContentPart[] = [{ type: "text", text: [
         `你是视频监制。项目 ${options.projectId}，环节 ${stage}，证据批次 ${batch + 1}/${batches}。`,

@@ -19,7 +19,8 @@ const CLOSURE = Object.freeze([...new Set(['src/content-ops-worker/adapters.mjs'
   'src/content-ops-worker/protocol.mjs', 'scripts/content-ops-worker.mjs', 'src/domain/content-ops-coverage.mjs',
   'src/domain/product-naming.mjs',
   'src/domain/hash.mjs', 'src/domain/strict-json.mjs', 'src/domain/errors.mjs',
-  'src/model-routing/budget.mjs', 'src/model-routing/dispatcher.mjs', 'src/model-routing/errors.mjs',
+  'src/model-routing/codex.mjs', 'src/model-routing/codex-pricing.mjs', 'src/model-routing/budget.mjs',
+  'src/model-routing/dispatcher.mjs', 'src/model-routing/errors.mjs',
   'src/model-routing/policy.mjs', 'src/model-routing/registry.mjs', 'src/model-routing/tokenizer.mjs',
   'engines/video-edit/packages/base/model-router/deepseek-window.mjs',
   'engines/video-edit/packages/base/model-router/assets/deepseek-v4-tokenizer.json',
@@ -47,7 +48,7 @@ export async function contentOpsAdapterBindings(options = {}) {
     && closure.sha256 === LOADED_SOURCE_CLOSURE.sha256, 'ADAPTER_SOURCE_CHANGED',
   'The loaded worker code differs from the current source closure; restart from the exact approved checkout.');
   return ALL_KINDS.map(kind => ({ kind, adapterId: kind, version: WORKER_VERSION, entrypointSha: closure.sha256,
-    validatorVersion: VALIDATOR_VERSION, fixedTransport: MODEL_TASK_KINDS.includes(kind) ? 'single_model_post'
+    validatorVersion: VALIDATOR_VERSION, fixedTransport: MODEL_TASK_KINDS.includes(kind) ? 'single_openai_responses'
       : ['image.compose', 'document.render', 'video.assemble', 'video.reedit', 'media.inspect'].includes(kind) ? 'fixed_native_local' : 'deterministic_local',
     nativeCapabilityId: null }));
 }
@@ -210,7 +211,7 @@ export async function createContentOpsAdapters({ rootDir = ROOT, model, modelCon
         // never merely their names or a statement that the files exist.
         source = { ...source, attachmentTexts: inputs.filter(row => /^(?:text\/|application\/(?:json|x-ipynb\+json))/.test(row.mime))
           .map(row => ({ id: row.id, sha256: bytesHash(row.bytes), mime: row.mime, text: new TextDecoder('utf-8', { fatal: true }).decode(row.bytes) })) };
-        const result = await runCall('model.1', await modelAdapter.prepare(kind, source));
+        const result = await runCall('model.1', await modelAdapter.prepare(kind, source, { signal }));
         let modelValue = result.value;
         if (!CHECK_KINDS.has(kind)) {
           const naming = normalizeGeneratedTextContent(modelValue);

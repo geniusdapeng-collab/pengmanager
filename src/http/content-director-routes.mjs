@@ -114,6 +114,13 @@ export async function routeContentDirector({
     methodNotAllowed(response, ["GET", "POST"]);
     return true;
   }
+  if (path === "/api/content-director/jobs/agent-draft") {
+    if (request.method !== "POST") { methodNotAllowed(response, ["POST"]); return true; }
+    if (principal.method !== "local") throw new ApiError(403, "EDITORIAL_AGENT_LOCAL_ONLY", "图文 Agent 写入仅可用于本机所有者工作台。");
+    const payload = await contentDirector.createJob(await readJsonBody(request), ctx, { agentDispatchRequired: true });
+    writeJson(response, 201, payload, { ETag: payload.etag });
+    return true;
+  }
   if (path === "/api/content-director/batches") {
     if (request.method === "GET") {
       writeJson(response, 200, contentDirector.listBatches());
@@ -148,6 +155,14 @@ export async function routeContentDirector({
     if (request.method !== "GET") { methodNotAllowed(response, ["GET"]); return true; }
     const payload = await contentDirector.getJob(job[1]);
     writeJson(response, 200, payload, payload.etag ? { ETag: payload.etag } : {});
+    return true;
+  }
+  const dispatch = path.match(new RegExp(`^/api/content-director/jobs/${ID}/agent-dispatch$`));
+  if (dispatch) {
+    if (request.method !== "POST") { methodNotAllowed(response, ["POST"]); return true; }
+    if (principal.method !== "local") throw new ApiError(403, "EDITORIAL_AGENT_LOCAL_ONLY", "图文 Agent 写入仅可用于本机所有者工作台。");
+    const payload = await contentDirector.dispatchAgentJob(dispatch[1], await readJsonBody(request), ctx);
+    writeJson(response, 202, payload, { ETag: payload.etag });
     return true;
   }
   if (path.match(new RegExp(`^/api/content-director/jobs/${ID}/steps$`))) {

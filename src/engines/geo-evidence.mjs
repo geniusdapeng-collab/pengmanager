@@ -6,7 +6,6 @@ import {
   PERSONAL_GEO_CASE,
   buildPersonalQueries,
 } from "../../engines/geo-evidence/personal-case.mjs";
-import { resolveDeepSeekApiKey } from "../adapters/auth.mjs";
 import { ApiError } from "../domain/errors.mjs";
 import { hashObject, hashText } from "../domain/hash.mjs";
 import { assertOperationReviewCurrent, reviewOperationEvidence } from "../services/operations-review.mjs";
@@ -142,20 +141,11 @@ export class PersonalGeoEngine {
   }
 
   async runVisibility({
-    provider = "deepseek-search",
+    provider = "codex-search",
     limit = 12,
     queryIds,
-    platform = "deepseek",
+    platform,
   } = {}) {
-    if (provider.startsWith("deepseek")) {
-      this.service.env = {
-        ...this.service.env,
-        DEEPSEEK_API_KEY: resolveDeepSeekApiKey(),
-        DEEPSEEK_BASE_URL:
-          process.env.DEEPSEEK_BASE_URL || "http://127.0.0.1:8788",
-        DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL || "deepseek-flash",
-      };
-    }
     const run = await this.service.runObservations({
       provider,
       limit,

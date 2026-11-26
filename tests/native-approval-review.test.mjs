@@ -48,8 +48,8 @@ async function fixture(t, { overlay = false, styleYear } = {}) {
 function responseFor(prepared, edits = {}) {
   return { value: { outcome: 'approve', evidenceHash: prepared.evidenceHash, reason: '物件位置和层级与场景一致。',
     checks: Object.fromEntries(prepared.checks.map(key => [key, true])), ...edits },
-  receipt: { schemaVersion: 'workloom.model-receipt/v1', policy: { scene: 'approval.native' }, registry: { provider: 'deepseek' },
-    requestedModel: 'deepseek-flash', returnedModel: 'deepseek-flash', finishReason: 'stop', responseId: 'isolated-model-response',
+  receipt: { schemaVersion: 'workloom.model-receipt/v1', policy: { scene: 'approval.native' }, registry: { provider: 'openai' },
+    requestedModel: 'gpt-6.2-sol', returnedModel: 'gpt-6.2-sol', finishReason: 'stop', responseId: 'isolated-model-response',
     requestHash: '1'.repeat(64), responseHash: '2'.repeat(64), contentHash: '3'.repeat(64), policyHash: '4'.repeat(64),
     usage: { inputTokens: 970, outputTokens: 55, totalTokens: 1025 } } };
 }
@@ -57,7 +57,7 @@ function responseFor(prepared, edits = {}) {
 test('native AI receives the byte-bound crop and overlay through the structured vision dispatcher', async t => {
   const { dataRoot, record, sourcePath } = await fixture(t, { overlay: true });
   let response, called = 0;
-  const reviewer = createNativeApprovalReviewer({ dataRoot, dispatcher: { async completeTask(request) {
+  const reviewer = createNativeApprovalReviewer({ dataRoot, env: {}, dispatcher: { async completeTask(request) {
     called += 1;
     assert.equal(request.scene, 'approval.native');
     assert.equal(request.messages[1].content.length, 2);
@@ -71,7 +71,7 @@ test('native AI receives the byte-bound crop and overlay through the structured 
   const prepared = await reviewer.prepare(record);
   response = responseFor(prepared);
   const verdict = await reviewer.review(prepared);
-  assert.equal(verdict.providerReceipt.model, 'deepseek-flash');
+  assert.equal(verdict.providerReceipt.model, 'gpt-6.2-sol');
   assert.equal(verdict.outcome, 'approve');
   response = responseFor(prepared, { evidenceHash: 'e'.repeat(64) });
   await assert.rejects(reviewer.review(prepared), { code: 'NATIVE_APPROVAL_VERDICT_INVALID' });
@@ -90,7 +90,7 @@ test('native AI receives the byte-bound crop and overlay through the structured 
 test('new native reviews require a contemporary style verdict grounded in reviewed pixels', async t => {
   const { dataRoot, record } = await fixture(t, { styleYear: 2026 });
   let verdict;
-  const reviewer = createNativeApprovalReviewer({ dataRoot, dispatcher: { async completeTask({ messages }) {
+  const reviewer = createNativeApprovalReviewer({ dataRoot, env: {}, dispatcher: { async completeTask({ messages }) {
     const [instruction, image] = messages[1].content;
     assert.match(instruction.text, /contemporaryStyle.*2026 年/u);
     assert.match(instruction.text, /门店、工厂/u);

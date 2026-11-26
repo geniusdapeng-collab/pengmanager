@@ -10,6 +10,7 @@ import {
   canonicalDeepSeekModel,
 } from "./token-budget.js";
 import { OpenAiCompatibleProvider, MockProvider, type ModelProvider } from "./providers.js";
+import { CodexTextProvider, usesCodexText } from "./codex-provider.js";
 import type { Tier3 } from "./policy.js";
 
 export interface ModelSpec {
@@ -50,6 +51,10 @@ function normalizedDeepSeekBaseUrl(env: NodeJS.ProcessEnv): string {
 export function poolFromEnv(
   opts: { mockOpts?: Record<string, { failFirst?: number; down?: boolean }> } = {},
 ): Map<string, ModelProvider> {
+  if (usesCodexText()) {
+    const provider = new CodexTextProvider({ model: process.env.LLM_MODEL });
+    return new Map([[provider.modelId, provider]]);
+  }
   const declared = (process.env.LLM_PROVIDER ?? "mock").trim().toLowerCase();
   if (!["mock", "deepseek"].includes(declared)) {
     throw new Error(`LLM_PROVIDER=${declared} 不在 text.primary registry 中`);
