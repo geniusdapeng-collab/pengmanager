@@ -78,7 +78,7 @@ export function suggestArticleIllustrations({ title, summary = "", body }) {
   const actions = {
     architecture: "画清本节涉及的角色、部件、边界和连接关系",
     logic: "画清本节的行动顺序、判断条件与返回路径",
-    scene: "再现本节涉及的人、地点、动作和现场道具",
+    scene: "从正文线索选一个具体动作，写清主体、动作发生的地点、关键物件和取景角度",
   };
   return {
     articleType,

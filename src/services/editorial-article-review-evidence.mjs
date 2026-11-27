@@ -1,4 +1,4 @@
-import { articleIllustrationStyleRule } from "../../public/article-illustration-style.js";
+import { articleIllustrationSceneDirection, articleIllustrationStyleRule } from "../../public/article-illustration-style.js";
 import { articleIllustrationPlanHash, assertArticleIllustrations } from "../domain/article-illustrations.mjs";
 import { claimEditorialFingerprint, destinationEditorialIdentity, editorialEditionSnapshot, publicEditorialClaim } from "../domain/editorial.mjs";
 import { PolicyError } from "../domain/errors.mjs";
@@ -7,7 +7,7 @@ import { hashObject, hashText } from "../domain/hash.mjs";
 export const ORIGINAL_ILLUSTRATION_REVIEW = "pengmanager.original-illustration-review/v1";
 
 export function articleIllustrationStyleCriterion(year) {
-  return `对照 verifiedIllustrations 的图位、类型和附件次序，逐张检查本次新增配图的实际像素。场景图：${articleIllustrationStyleRule("scene", year)} 架构图和逻辑图：${articleIllustrationStyleRule("logic", year)} 说明可见依据。风格明显过时应 fail，像素证据不足应 unknown。只有工作单年份或描述不能给出 pass。`;
+  return `对照 verifiedIllustrations 的图位、类型和附件次序，逐张检查本次新增配图的实际像素。场景图：${articleIllustrationSceneDirection(year)} 架构图和逻辑图：${articleIllustrationStyleRule("logic", year)} 说明可见依据。风格明显过时应 fail，像素证据不足应 unknown。只有工作单年份或描述不能给出 pass。`;
 }
 
 export function originalIllustrationCriteria(stage, styleYear) {
