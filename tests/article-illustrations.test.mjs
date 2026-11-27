@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { articleIllustrationStyleYear } from "../public/article-illustration-style.js";
+import { articleIllustrationImageGenPrompt } from "../public/article-illustration-work-order.js";
 import { articleSceneWorkOrder } from "../src/video-runtime/article-visuals.mjs";
 import { originalIllustrationCriteria } from "../src/services/editorial-article-review-evidence.mjs";
 import { hashObject } from "../src/domain/hash.mjs";
@@ -18,7 +19,13 @@ const blocks = body.split("\n\n").map(text => ({ type: "paragraph", text }));
 const article = { title, summary: "对照每个独立环节和业务场景。", body, locale: "zh-CN" };
 
 async function newFixture(t, imageGeneration = false) {
-  const f = await editorialFixture(t);
+  const f = await editorialFixture(t, { seedTransform(seed) {
+    if (!seed.claims.some(claim => claim.id === "C003")) {
+      seed.claims.push({ id: "C003", type: "project", text: "Node.js publishes its API reference online.",
+        source: { label: "Node.js API reference", url: "https://nodejs.org/docs/latest/api/", visibility: "public" },
+        evidenceLevel: "B", state: "draft", publicLevel: "private", sensitivity: "low", expiresAt: null });
+    }
+  } });
   await readyWebsite(f);
   const story = await f.service.createStory({ workingTitle: title, claimIds: ["C003"] }, context());
   const suggestion = f.service.suggestIllustrations(articleText());
@@ -75,6 +82,7 @@ test("suggestions distinguish three article types and point to body excerpts", a
   assert.equal(f.plan.articleType, "technical");
   assert.deepEqual(f.plan.slots.map(slot => slot.kind), ["architecture", "logic", "scene"]);
   for (const slot of f.plan.slots) assert.ok(body.includes(slot.anchor));
+  assert.match(f.plan.slots[2].description, /具体动作.*地点.*关键物件.*取景角度.*正文线索/u);
   const lifestyle = f.service.suggestIllustrations({ title: "周末徒步与咖啡", summary: "记一次日常旅行",
     body: "周末我沿河散步。\n\n半山旁有露营的人在冲咖啡。\n\n傍晚从林间回家整理照片。" });
   assert.equal(lifestyle.articleType, "lifestyle");
@@ -104,7 +112,8 @@ test("new plans freeze a 2026-or-later style across official work orders without
   assert.equal(fresh.styleYear, articleIllustrationStyleYear(new Date(FIXED_TIME)));
   assert.equal(fresh.sourceHash, articleIllustrationSourceHash(article));
   assert.equal(scene.workOrder.slot.description, fresh.slots[2].description);
-  assert.match(scene.imageGenPrompt, /互联网或科技公司/u);
+  assert.doesNotMatch(scene.imageGenPrompt, /互联网或科技公司/u);
+  assert.match(scene.workOrder.visualStyle, /互联网或科技公司/u);
   assert.ok(scene.imageGenPrompt.includes(fresh.slots[2].alt));
   assert.ok(scene.imageGenPrompt.includes(`PM-VISUAL-STYLE contemporary-tech-v1/${fresh.styleYear}`));
   assert.match(diagram.workOrder.visualStyle, /清晰字号层级/u);
@@ -115,7 +124,30 @@ test("new plans freeze a 2026-or-later style across official work orders without
   assert.ok(!Object.hasOwn(originalIllustrationCriteria("release"), "contemporary_style"));
   for (const stage of ["variant", "release"]) {
     assert.match(originalIllustrationCriteria(stage, styleYear).contemporary_style, /实际像素.*过时应 fail/su);
+    assert.doesNotMatch(originalIllustrationCriteria(stage, styleYear).contemporary_style, /互联网或科技公司/u);
   }
+});
+
+test("scene prompts give the visible action and setting priority, including an explicitly requested meeting", () => {
+  const plan = { id: "ILP-00001", sourceHash: "a".repeat(64), title: "工作现场记录", styleYear: 2026 };
+  const warehouse = { id: "slot-3", kind: "scene", anchor: "库管在凌晨交接存货。",
+    description: "从横梁下的低机位拍摄库管在卸货口点验托盘。", alt: "库管的手指向托盘中的第二件货物。" };
+  const briefing = { ...warehouse, anchor: "班前会确认当日的改造范围。",
+    description: "两名员工在检修班前会上围桌查看一张停机图。", alt: "班组长指向会议桌上标出的检修区。" };
+  for (const slot of [warehouse, briefing]) {
+    const prompt = articleIllustrationImageGenPrompt(plan, slot);
+    assert.ok(prompt.includes(slot.anchor));
+    const directionStart = prompt.indexOf("表现方式");
+    for (const text of [slot.description, slot.alt]) {
+      const position = prompt.indexOf(text);
+      assert.ok(position >= 0 && position < directionStart);
+    }
+    assert.doesNotMatch(prompt, /现代互联网或科技公司|整洁工位/u);
+    assert.ok(prompt.endsWith(`PM-VISUAL-STYLE contemporary-tech-v1/2026\nPM-ILLUSTRATION ILP-00001/slot-3 ${plan.sourceHash}`));
+  }
+  assert.ok(!articleIllustrationImageGenPrompt(plan, warehouse).includes(briefing.description));
+  assert.match(articleIllustrationImageGenPrompt(plan, { ...warehouse, kind: "logic" }), /干净网格/u);
+  assert.doesNotMatch(articleIllustrationImageGenPrompt({ ...plan, styleYear: undefined }, warehouse), /PM-VISUAL-STYLE/u);
 });
 
 test("a numbered Markdown list suggestion points to the rendered text and can place its illustration", async t => {

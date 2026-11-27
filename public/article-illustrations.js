@@ -16,7 +16,7 @@ function slotFields(slot = {}, index) {
     <legend>第 ${index + 1} 张配图</legend>
     <label><span>图片类型</span><select name="ill-kind-${index}" data-illustration-entry="kind">${options(Object.entries(KINDS), slot.kind)}</select></label>
     <label class="wide"><span>配图位置（正文中的唯一短语）</span><input name="ill-anchor-${index}" data-illustration-entry="anchor" maxlength="300" value="${html(slot.anchor || "")}" /></label>
-    <label class="wide"><span>画面内容及要说明的问题</span><textarea name="ill-description-${index}" data-illustration-entry="description" rows="2" maxlength="1000">${html(slot.description || "")}</textarea></label>
+    <label class="wide"><span>画面内容及要说明的问题</span><textarea name="ill-description-${index}" data-illustration-entry="description" rows="2" maxlength="1000" placeholder="场景图写清可见主体、地点、关键动作和取景">${html(slot.description || "")}</textarea></label>
     <label><span>替代文字</span><input name="ill-alt-${index}" data-illustration-entry="alt" maxlength="500" value="${html(slot.alt || "")}" /></label>
     <label><span>图注（可选）</span><input name="ill-caption-${index}" data-illustration-entry="caption" maxlength="500" value="${html(slot.caption || "")}" /></label>
     <label class="check-label wide"><input type="checkbox" name="ill-image-generation-${index}" data-illustration-entry="imageGeneration"${slot.imageGeneration ? " checked" : ""} /><span>需要使用内置生图工具生成原始素材</span></label>

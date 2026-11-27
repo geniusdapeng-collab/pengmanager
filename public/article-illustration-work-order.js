@@ -1,4 +1,4 @@
-import { articleIllustrationStyleMarker, articleIllustrationStyleRule } from "./article-illustration-style.js";
+import { articleIllustrationSceneDirection, articleIllustrationStyleMarker, articleIllustrationStyleRule } from "./article-illustration-style.js";
 
 export function articleIllustrationWorkOrder(plan, slot) {
   if (slot.kind === "scene" && !/^[a-f0-9]{64}$/.test(slot.sceneBriefHash ?? "")) {
@@ -17,6 +17,10 @@ export function articleIllustrationWorkOrder(plan, slot) {
 export function articleIllustrationImageGenPrompt(plan, slot) {
   const marker = `PM-ILLUSTRATION ${plan.id}/${slot.id} ${plan.sourceHash}`;
   if (plan.styleYear !== undefined) {
+    if (slot.kind === "scene") {
+      const direction = articleIllustrationSceneDirection(plan.styleYear);
+      return `请用内置生图工具（需求配置 image2.5）为《${plan.title}》生成一张场景图。\n\n需要忠实呈现的画面：${slot.description}\n正文锚点（用于理解场景）：${slot.anchor}\n替代文字中出现的可见主体、物件和动作须能直接看出：${slot.alt}\n\n表现方式：${direction}\n\n保留以下两行工单标记作为工具提示中的追踪信息，画面内不要出现标记或文字。\n${articleIllustrationStyleMarker(plan.styleYear)}\n${marker}`;
+    }
     const style = articleIllustrationStyleRule(slot.kind, plan.styleYear);
     return `请用内置生图工具（需求配置 image2.5）为《${plan.title}》生成一张配图。\n\n必须符合的画面风格：${style}\n\n需要忠实呈现的画面：${slot.description}\n替代文字中出现的可见主体、物件和动作须能直接看出：${slot.alt}\n\n保留以下两行工单标记作为工具提示中的追踪信息，画面内不要出现标记或文字。\n${articleIllustrationStyleMarker(plan.styleYear)}\n${marker}`;
   }
