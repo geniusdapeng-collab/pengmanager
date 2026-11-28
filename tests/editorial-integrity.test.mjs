@@ -12,6 +12,10 @@ test("sensitive scan exempts validated machine digest and community IDs while ke
   const digest = `a13800138000a${"b".repeat(51)}`;
   assert.equal(digest.length, 64);
   assert.doesNotThrow(() => editorialInput({ sha256: digest, serverId: "123456789012345678", channelId: "13800138000" }, ["sha256", "serverId", "channelId"]));
+  assert.doesNotThrow(() => editorialInput({
+    manifestHash: digest, items: [{ baseSnapshotHash: digest, expectedPublicSnapshotHash: digest }],
+  }, ["manifestHash", "items"]));
+  assert.throws(() => editorialInput({ manifestHash: digest.slice(0, -1) }, ["manifestHash"]), { code: "EDITORIAL_SENSITIVE_INPUT" });
   assert.throws(() => editorialInput({ body: digest }, ["body"]), { code: "EDITORIAL_SENSITIVE_INPUT" });
   assert.throws(() => editorialInput({ sha256: digest.slice(0, -1) }, ["sha256"]), { code: "EDITORIAL_SENSITIVE_INPUT" });
   assert.throws(() => editorialInput({ serverId: "x13800138000" }, ["serverId"]), { code: "EDITORIAL_SENSITIVE_INPUT" });
@@ -245,4 +249,35 @@ test("readback rechecks Claim eligibility at completion rather than using a stal
   };
   await assert.rejects(f.service.verifyRelease(active.id, { confirm: true }, context(active)), { code: "CONTENT_APPROVAL_BLOCKED" });
   assert.deepEqual(f.store.snapshot(), before); assert.equal(f.service.getRelease(active.id).receipt, null);
+});
+
+test("slow public readback leaves the writer available and cannot verify a withdrawn route", async t => {
+  const f = await editorialFixture(t); await readyWebsite(f);
+  const { variant } = await createEditionVariant(f);
+  const release = await approvedRelease(f, variant), active = await activateRelease(f, release);
+  const completeReadback = f.service.verifyReadback;
+  let signalStarted, resumeReadback;
+  const started = new Promise(resolve => { signalStarted = resolve; });
+  const wait = new Promise(resolve => { resumeReadback = resolve; });
+  f.service.verifyReadback = async expected => {
+    signalStarted();
+    await wait;
+    return completeReadback(expected);
+  };
+  const pending = assert.rejects(f.service.verifyRelease(active.id, { confirm: true }, context(active)), { code: "PRECONDITION_FAILED" });
+  await started;
+  let timer;
+  try {
+    const withdrawn = await Promise.race([
+      f.service.withdrawRelease(active.id, { reason: "撤稿与慢回读并发的隔离验证。" }, context(active)),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Readback blocked the writer")), 3000); }),
+    ]);
+    assert.equal(withdrawn.status, "withdrawn");
+  } finally {
+    clearTimeout(timer);
+    resumeReadback();
+    await Promise.allSettled([pending]);
+  }
+  await pending;
+  assert.equal(f.service.getRelease(active.id).receipt, null);
 });

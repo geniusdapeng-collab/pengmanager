@@ -93,11 +93,46 @@ P0 是完整正文、不可变修订、独立渠道稿、精确审核、真实�
 
 “审核通过”本身不会公开素材。每次公开 GET、HEAD、Range 和条件请求都重新检查资格；撤销素材、撤回稿件或相关事实失效后，旧 ETag 也不能换来公开 304。已被访客下载的副本无法通过撤稿远程收回。
 
+## 官网原址批量修订
+
+在管理后台“编辑出版 → 原址批量修订”导入 UTF-8 JSON。每批最多 100 篇、请求最多 16 MB。清单为
+`{destinationId,items:[{storyId,canonicalPath,baseReleaseId,baseSnapshotHash,title,summary,body,blocks,claimIds,...}]}`。
+`canonicalPath` 使用原中文文章地址，`baseReleaseId` 和 `baseSnapshotHash` 使用当下活动的正式 CMS 版本。
+`blocks` 可省略，由原始正文解析。批次预检先返回逐篇错误，再决定是否保存。保存只开始准备母稿。
+
+- 两张解释性图解使用 `articleType`、`illustrationPolicy:"diagram-pair-v1"` 和两个 `illustrations`
+  条目。每条提交 `{kind,anchor,description,alt,caption,assetId,sha256}`，按顺序为架构图和逻辑图，锚点来自准确新正文。
+- 带场景图或沿用默认规格时，先为同一选题的准确新正文完成正式 `illustrationPlanId`，保留各场景原生审核与制作签章。批次复用已审核图片，由素材 ID 与 SHA-256 引用。
+- 母稿就绪后核对新旧正文、图位和素材，逐篇勾选，再明确写下此次公开授权范围。授权有效期 24 小时。浏览器关闭后，服务端继续处理已授权条目。
+- 同组最多 5 篇。完整备份与公开激活成功后，分别回读实际 HTML、公开 API 和图片字节。等待原审核时继续对账原工单。并发替换、审核拒绝及媒体问题在对应文章行显示。网络异常后可用原批次号续办。
+- 单篇恢复会比较该地址的当前活动版本和准确前版。旧版仍具有真实公开回执、公开资格和准确媒体时才能恢复。历史回执仍可审计。
+
+| 方法 | 路径 | 行为 |
+|---|---|---|
+| POST | `/api/editorial/revision-batches/preflight` | 只读预检清单，返回摘要与逐篇结果 |
+| GET／POST | `/api/editorial/revision-batches` | 最近批次列表或保存清单 |
+| GET | `/api/editorial/revision-batches/:id` | 按批次号读取文章、步骤、错误、授权状态与回执，可附 `offset`、`limit` 分页 |
+| POST | `/api/editorial/revision-batches/:id/authorize` | 提交 `{manifestHash,items:[{id,editionSnapshotHash}],authorizationNote}` |
+| POST | `/api/editorial/revision-batches/:id/items/:itemId/retry` | 续办同一篇和原工单，按需附当前审核的 `reviewProofs` |
+| POST | `/api/website/releases/:id/rollback` | 提交 `{expectedPreviousReleaseId,reason}`，只恢复仍活动的批次版本 |
+
+写入接口使用幂等键，授权、续办与恢复同时使用当前 `If-Match`。受限 Agent 令牌无法调用这些管理接口。
+
+### 从现有代码直发接回后台
+
+已有直发内容包的部署，在停用旧代码前把实际 `publication-overlay` 目录保存在受保护位置，通过
+`ARTICLE_OVERLAY_DIRECTORY` 指定其绝对路径。使用 `scripts/prepare-article-takeover-batch.mjs`，
+输入现有内容包、既有公网回执与真实素材审核清单。脚本离线验证公网摘要和 PNG 字节，输出待导入的私有批次清单。
+导入前应核对真实 CMS 素材及使用权。授权清单包含当前访客可见的 `expectedPublicSnapshotHash`，
+实际激活前再比较标题、摘要、正文、结构、图序、图注、来源、原网址与图片字节。先核对有场景图和双图的各一篇，
+再扩大批次。已接回的文章使用正式 Release，旧图片地址在其相同字节仍获公开授权时继续工作。
+从原网址逐篇取得正式回执并核对原图后，再撤下内容包。保留受保护的原内容包。退役后要单篇恢复接管前的版本，先重新配置该内容包。恢复前会校验原快照和实际图片字节。
+
 ## 官网激活与真实回读
 
 公开地址为 `/:lang/articles|visuals|videos/:slug`，`lang` 为 `zh` 或 `en`。slug 为不超过 100 字符的小写英文、数字与单连字符。同一语言形式的后续修订沿用正式 URL。
 
-官网新文章及改版须绑定准确母稿的配图计划，完成至少三张不同图片的实际字节、来源、图位与审核检查。操作可从文章形式的语言修订或创作总控开始。 [文章配图校验](../src/domain/article-illustrations.mjs)
+官网新文章及改版须绑定准确母稿的配图计划。默认至少三张不同图片。已授权的批量技术或产品改稿可用 `diagram-pair-v1`，绑定一张架构图与一张逻辑图。每张图均要核对实际字节、来源、图位与审核，已冻结计划按自己的原规则处理。 [文章配图校验](../src/domain/article-illustrations.mjs)
 
 1. 核对真实官网目的地、公开可用 Claim 和实际媒体，建立原文与独立官网稿。
 2. 对完整稿件事实核验、批准、排期，再创建私有官网修订。

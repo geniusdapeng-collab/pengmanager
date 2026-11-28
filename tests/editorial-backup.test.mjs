@@ -180,3 +180,35 @@ test("backups refuse unsafe base directories and forged manifest paths rather th
   await chmod(join(f.directory, "backups"), 0o755);
   await rejected(f.backup.captureCurrent(), "EDITORIAL_BACKUP_UNSAFE_PATH");
 });
+
+test("a grouped backup records and verifies exact approved releases against their previous active routes", async t => {
+  const f = await fixture(t, { assets: 1 });
+  const candidates = [1, 2].map(index => ({
+    releaseId: `WRE-batch-${index}`, canonicalPath: `/zh/articles/backup-fixture-${index}`,
+    snapshotHash: String(index).repeat(64), previousReleaseId: `WRE-old-${index}`,
+  }));
+  await f.store.mutate({ type: "fixture.batch_candidates", actor: "test" }, state => {
+    for (const [index, item] of candidates.entries()) {
+      state.websiteReleases.push({ id: item.releaseId, canonicalPath: item.canonicalPath, snapshotHash: item.snapshotHash,
+        status: "approved", storyId: `story-${index}`, previousReleaseId: item.previousReleaseId });
+      state.websiteRoutes.push({ id: `route-${index}`, canonicalPath: item.canonicalPath, storyId: `story-${index}`,
+        activeReleaseId: item.previousReleaseId });
+    }
+  });
+  const before = f.store.snapshot();
+  const { result } = await f.store.mutate({ type: "fixture.read_only_backup", actor: "test", includeState: false }, async state => {
+    const receipt = await f.backup.captureBatchCommitted(candidates, state);
+    return JsonStore.noChange(receipt);
+  });
+  assert.deepEqual(result.candidates, candidates);
+  assert.equal(result.stage, "pre_batch_activation");
+  assert.deepEqual(f.store.snapshot(), before);
+  const verified = await verifyEditorialBackup({ store: f.store, backupId: result.backupId, expectedManifestSha256: result.manifestSha256 });
+  assert.deepEqual(verified.candidates, candidates);
+  assert.equal(verified.filesVerified, 2);
+
+  const changed = [{ ...candidates[0], previousReleaseId: "WRE-unrelated" }, candidates[1]];
+  await rejected(f.store.mutate({ type: "fixture.rejected_backup", actor: "test" }, async state =>
+    JsonStore.noChange(await f.backup.captureBatchCommitted(changed, state))), "EDITORIAL_BACKUP_CANDIDATE_MISMATCH");
+  assert.deepEqual(f.store.snapshot(), before);
+});

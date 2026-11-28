@@ -328,9 +328,26 @@ export function createAiApproval({ directory, origin, model, modelId = codexText
   }
 
   return {
+    async inspectReview(reviewId) {
+      assert(typeof reviewId === "string" && SHA.test(reviewId), "AI_APPROVAL_SUBJECT_INVALID", "缺少准确的原审核编号。");
+      await prepare();
+      for (const kind of ["result", "local-result"]) {
+        if (await readRecord(file(reviewId, kind), 32_768)) return { status: "ready", reviewId };
+      }
+      const blocked = await readRecord(file(reviewId, "failure"), 4096);
+      const lease = await readRecord(file(reviewId, "lease"), 4096);
+      if (blocked || lease && clock().getTime() > Date.parse(lease.leasedAt) + MAX_LEASE_MS ||
+          await readRecord(file(reviewId, "local-attempt"), 4096) && !inFlight.has(reviewId)) {
+        return { status: "unresolved", reviewId };
+      }
+      return { status: "pending", reviewId };
+    },
     async review(input) {
       await prepare();
       const order = aiApprovalWorkOrder(input);
+      if (input.expectedReviewId !== undefined && input.expectedReviewId !== order.evidenceHash) {
+        fail(409, "AI_APPROVAL_INPUT_CHANGED", "原审核证据已变化，需重新核对稿件，本次未重新派单。");
+      }
       const description = await workerKey();
       if (input.proof !== undefined) {
         assert(description, "AI_APPROVAL_WORKER_REQUIRED", "需先配置专用 AI 审核工位公钥。");

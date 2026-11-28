@@ -1,4 +1,5 @@
 import { ApiError, PolicyError } from "../domain/errors.mjs";
+import { assertArticleTakeoverParity } from "../domain/article-takeover.mjs";
 import { articleIllustrationStyleYear } from "../../public/article-illustration-style.js";
 import { articleIllustrationImageGenPrompt, articleIllustrationWorkOrder } from "../../public/article-illustration-work-order.js";
 import { createHash } from "node:crypto";
@@ -239,7 +240,8 @@ async function illustrationFingerprint(mediaAssets, asset, state) {
 export class EditorialService {
   constructor({ store, geoService = null, mediaAssets = null, productionArtifacts = null, publicOrigin = "https://pengmanager.com",
     clock = () => new Date(), verifyReadback = null, beforeActivation = null, aiApproval = null,
-    illustrationCohort = OFFICIAL_ILLUSTRATION_COHORT } = {}) {
+    illustrationCohort = OFFICIAL_ILLUSTRATION_COHORT, validateRevisionBatchExecution = null,
+    projectPublicArticle = null, verifyRollbackProjection = null } = {}) {
     this.store = store;
     this.geoService = geoService;
     this.mediaAssets = mediaAssets;
@@ -250,6 +252,9 @@ export class EditorialService {
     this.beforeActivation = beforeActivation;
     this.aiApproval = aiApproval;
     this.illustrationCohort = illustrationCohort;
+    this.validateRevisionBatchExecution = validateRevisionBatchExecution;
+    this.projectPublicArticle = projectPublicArticle;
+    this.verifyRollbackProjection = verifyRollbackProjection;
   }
 
   #state(state = this.store.snapshot()) {
@@ -259,8 +264,19 @@ export class EditorialService {
     return state;
   }
 
-  #writeIdentity(scope, input, ctx) {
-    if (!ctx || typeof ctx !== "object" || !["local", "session"].includes(ctx.method)) throw new ApiError(403, "AGENT_SCOPE_DENIED", "编辑与公开发布操作仅允许管理员。");
+  #assertEditorialAuthority(scope, input, ctx, state) {
+    if (ctx && typeof ctx === "object" && (["local", "session"].includes(ctx.method) ||
+        ctx.method === "editorial-batch" && this.validateRevisionBatchExecution?.(state ?? this.#state(), ctx, scope, input, this.clock()))) return;
+    throw new ApiError(403, "AGENT_SCOPE_DENIED", "编辑与公开发布操作仅允许管理员或该批次已授权的执行器。");
+  }
+
+  #expectedRevisionReview(ctx, kind, id, snapshotHash) {
+    const review = ctx.method === "editorial-batch" && ctx.expectedReview;
+    return review?.proofKey === `${kind}:${id}:${snapshotHash}` ? { expectedReviewId: review.reviewId } : {};
+  }
+
+  #writeIdentity(scope, input, ctx, state) {
+    this.#assertEditorialAuthority(scope, input, ctx, state);
     const actor = editorialText(ctx.actor, "actor", 120);
     if (typeof ctx.idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(ctx.idempotencyKey)) {
       throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "新编辑操作必须提供 8 到 128 位 Idempotency-Key。");
@@ -284,6 +300,7 @@ export class EditorialService {
     const { result } = await this.store.mutate({ type: `editorial.${scope.split(":")[0]}`,
       actor: review?.aiReview?.actor ?? review?.effectActor ?? actor, payload, includeState: false }, async state => {
       this.#state(state);
+      this.#assertEditorialAuthority(scope, input, ctx, state);
       const previous = state.editorialRequests.find(row => row.keyHash === keyHash);
       if (previous) {
         if (previous.requestHash !== requestHash) throw new ApiError(409, "IDEMPOTENCY_CONFLICT", "此幂等键已用于不同请求。");
@@ -297,7 +314,7 @@ export class EditorialService {
   }
 
   #priorRequest(state, scope, input, ctx) {
-    const { keyHash, requestHash } = this.#writeIdentity(scope, input, ctx);
+    const { keyHash, requestHash } = this.#writeIdentity(scope, input, ctx, state);
     const prior = state.editorialRequests.find(row => row.keyHash === keyHash);
     if (prior && prior.requestHash !== requestHash) throw new ApiError(409, "IDEMPOTENCY_CONFLICT", "此幂等键已用于不同请求。");
     return prior;
@@ -480,8 +497,11 @@ export class EditorialService {
   }
 
   async createArticleIllustrations(storyId, input, ctx) {
-    editorialInput(input, ["locale", "articleType", "title", "summary", "body", "slots", "baseReleaseId"]);
+    editorialInput(input, ["locale", "articleType", "title", "summary", "body", "slots", "baseReleaseId", "illustrationPolicy"]);
     assertLocaleFormat(input.locale, "article");
+    if (input.illustrationPolicy !== undefined && ctx?.method !== "editorial-batch") {
+      throw new ApiError(403, "BATCH_AUTHORIZATION_REQUIRED", "双图规则仅用于已登记的原址批量修订。");
+    }
     return this.#write(`illustration_plan_created:${storyId}`, input, ctx, (state, { actor, ifMatch, now, payload }) => {
       const story = record(state.stories, storyId, "STORY_NOT_FOUND"); assertMatch(story, ifMatch);
       if (story.status === "archived") throw new PolicyError("STORY_ARCHIVED", "不能在已归档选题上新增配图计划。");
@@ -1040,9 +1060,9 @@ export class EditorialService {
 
   async transitionVariant(id, input, ctx, { previousReleaseId, websiteAuthorization } = {}) {
     editorialInput(input, ["target", "note", "reviewed", "snapshotHash", "reviewSnapshotHash", "reviewProof"]);
-    if (!["local", "session"].includes(ctx?.method)) throw new ApiError(403, "AGENT_SCOPE_DENIED", "编辑审核与排期仅允许管理员。");
     const scope = `variant_transitioned:${id}`;
     const { reviewProof, ...writeInput } = input;
+    this.#assertEditorialAuthority(scope, writeInput, ctx);
     const reviewOptions = { publicOrigin: this.publicOrigin, previousReleaseId, websiteAuthorization };
     let aiReview, articleEvidenceHash, originalReviewBinding;
     if (["approved", "scheduled"].includes(input.target)) {
@@ -1080,6 +1100,7 @@ export class EditorialService {
         if (!evidence.articleReview && editorialSensitiveFindings(evidence).length) throw new PolicyError("AI_APPROVAL_SENSITIVE_INPUT", "渠道审核输入含有须先处理的敏感资料。");
         aiReview = await this.aiApproval.review({
           kind: "editorial.variant", subjectId: id, snapshotHash: row.snapshotHash, proof: reviewProof, evidence,
+          ...this.#expectedRevisionReview(ctx, "editorial.variant", id, row.snapshotHash),
           criteria: originalReviewBinding ? originalIllustrationCriteria("variant", evidence.articleReview?.styleYear) : ["用绑定来源核对完整稿件中的事实、数量、日期、出处和适用范围，分辨事实和意见。",
             "核对渠道、版本、正文结构、图片上下文、替代文字和图注；保留已有素材实际审核边界。",
             "外发由独立授权与发布步骤负责。本次不能创造权限、改写原文或批准缺乏依据的结论。",
@@ -1213,6 +1234,15 @@ export class EditorialService {
   }
 
   async publishEditionWithAi(editionId, input, ctx) {
+    return this.#publishWebsiteEdition(editionId, input, ctx, false);
+  }
+
+  async prepareRevisionBatchEdition(editionId, input, ctx) {
+    if (ctx?.method !== "editorial-batch") throw new ApiError(403, "BATCH_AUTHORIZATION_REQUIRED", "需要原址批次的发布授权。");
+    return this.#publishWebsiteEdition(editionId, input, ctx, true);
+  }
+
+  async #publishWebsiteEdition(editionId, input, ctx, prepareOnly) {
     editorialInput(input, ["destinationId", "slug", "editionSnapshotHash", "expectedPreviousReleaseId",
       "supersedesContentId", "publicationAuthorized", "authorizationNote", "reviewProofs"]);
     if (!this.aiApproval) throw new ApiError(503, "AI_APPROVAL_UNAVAILABLE", "官网 AI 审核服务尚未配置。");
@@ -1306,7 +1336,14 @@ export class EditorialService {
           authorizationNote: note, ...(proofs[proofKey] ? { reviewProof: proofs[proofKey] } : {}) }, stageContext("review-release", release),
         { websiteAuthorization });
       }
+      if (prepareOnly) {
+        if (!["approved", "live_unverified", "published"].includes(release.status)) {
+          throw new PolicyError("AI_PUBLICATION_VARIANT_BLOCKED", "官网修订尚未取得当前快照的公开批准。");
+        }
+        return { ...approvedIntent, editionId, contentId: variant.id, releaseId: release.id, status: release.status, receipt: release.receipt };
+      }
       if (release.status === "approved") {
+        if (ctx?.method === "editorial-batch") throw new PolicyError("BATCH_ACTIVATION_REQUIRED", "请先完成批次备份与正式激活。");
         release = await this.publishRelease(release.id, { confirm: true, expectedPreviousReleaseId: identity.expectedPreviousReleaseId },
           stageContext("activate", release));
       }
@@ -1321,7 +1358,7 @@ export class EditorialService {
       if (error instanceof ApiError) {
         error.details = { ...error.details, workflow: { ...approvedIntent, editionId, contentId: variant.id,
           ...(release ? { releaseId: release.id } : {}),
-          ...(["AI_APPROVAL_PENDING", "AI_APPROVAL_WORKER_REQUIRED"].includes(error.code) ? { proofKey } : {}) } };
+          ...(proofKey && error.details?.reviewId ? { proofKey } : {}) } };
       }
       throw error;
     }
@@ -1366,6 +1403,7 @@ export class EditorialService {
         }
         aiReview = await this.aiApproval.review({
           kind: "editorial.website_release", subjectId: id, snapshotHash: row.snapshotHash, proof: reviewProof,
+          ...this.#expectedRevisionReview(ctx, "editorial.website_release", id, row.snapshotHash),
           evidence,
           criteria: originalReviewBinding ? originalIllustrationCriteria("release", evidence.articleReview?.styleYear) : ["核对固定官网地址、当前替换范围、明确用户发布授权及公开事实来源。",
             "完整检查正文、图位、替代文字和图注，已登记媒体的授权证据必须与准确快照一致。",
@@ -1406,6 +1444,137 @@ export class EditorialService {
         ...(originalReviewBinding ? { articleReviewScope: ORIGINAL_ILLUSTRATION_REVIEW, articleReviewBinding: originalReviewBinding } : {}) };
       row.status = "approved"; row.revision += 1; row.updatedAt = now.toISOString(); payload.releaseId = id; return entity(row);
     }, aiReview ? async () => ({ aiReview }) : null);
+  }
+
+  async activateRevisionBatchGroup(entries) {
+    if (!Array.isArray(entries) || entries.length < 1 || entries.length > 10 ||
+        new Set(entries.map(entry => entry?.releaseId)).size !== entries.length ||
+        entries.some(entry => entry?.ctx?.method !== "editorial-batch")) {
+      throw new ApiError(400, "EDITORIAL_BATCH_ACTIVATION_INVALID", "一次批次激活须提交 1 至 10 个不同的已授权候选。");
+    }
+    const inputFor = entry => ({ confirm: true, expectedPreviousReleaseId: entry.expectedPreviousReleaseId });
+    if (!this.aiApproval || typeof this.beforeActivation?.captureBatchCommitted !== "function") {
+      throw new ApiError(503, "EDITORIAL_BACKUP_UNAVAILABLE", "批次激活需要正式审核和完整备份服务。");
+    }
+    const payload = { releaseIds: entries.map(entry => entry.releaseId) };
+    const { result } = await this.store.mutate({ type: "editorial.revision_batch_activated", actor: PUBLICATION_SYSTEM_ACTOR,
+      payload, includeState: false }, async state => {
+      this.#state(state);
+      const candidates = [], alreadyActive = [];
+      for (const entry of entries) {
+        try {
+          const { releaseId, expectedPreviousReleaseId, ctx } = entry;
+          this.#assertEditorialAuthority(`release_activated:${releaseId}`, inputFor(entry), ctx, state);
+          const item = state.revisionBatches.find(batch => batch.id === ctx.batchId).items.find(row => row.id === ctx.itemId);
+          const historical = item.workflowAuthorization;
+          const row = record(state.websiteReleases, releaseId, "RELEASE_NOT_FOUND");
+          const route = state.websiteRoutes.find(item => item.canonicalPath === row.canonicalPath);
+          if (route?.activeReleaseId === releaseId && ["live_unverified", "published"].includes(row.status) &&
+              row.previousReleaseId === expectedPreviousReleaseId && row.activationBackup?.stage === "pre_batch_activation") {
+            alreadyActive.push(entity(row));
+            continue;
+          }
+          assertMatch(row, ctx.ifMatch);
+          if (!route || route.activeReleaseId !== expectedPreviousReleaseId || row.previousReleaseId !== expectedPreviousReleaseId ||
+              route.storyId !== row.storyId) throw new ApiError(409, "RELEASE_ROUTE_CONFLICT", "正式 URL 的当前修订已变化，请重新核对。");
+          if (row.status !== "approved" || row.publicApproval?.snapshotHash !== row.snapshotHash ||
+              row.publicApproval.aiApproval?.snapshotHash !== row.snapshotHash || !historical ||
+              historical.editionSnapshotHash !== item.authorization.editionSnapshotHash ||
+              row.publicApproval.authorizedBy !== historical.actor || row.publicApproval.authorizationNote !== historical.note) {
+            throw new PolicyError("AI_APPROVAL_REQUIRED", "批次激活需要当前候选和替换范围的准确审核回执。");
+          }
+          const edition = record(state.editions, row.editionId, "EDITION_NOT_FOUND");
+          if (row.editionId !== item.editionId || row.canonicalPath !== item.draft.canonicalPath ||
+              edition.snapshotHash !== historical.editionSnapshotHash || state.editions.some(other =>
+                other.storyId === edition.storyId && other.locale === edition.locale && other.format === edition.format &&
+                other.editorialRevision > edition.editorialRevision)) {
+            throw new ApiError(409, "EDITORIAL_BATCH_EDITION_CHANGED", "母稿出现新的修订，请重新核对本次发布范围。");
+          }
+          const { content, base } = this.#validatePublicCandidate(state, row);
+          if (base) this.#assertOriginalReleaseReviewCurrent(state, row, content);
+          if (content.status !== "scheduled") throw new PolicyError("CONTENT_NOT_SCHEDULED", "官网激活前须将渠道稿排入待发布。");
+          if (typeof this.mediaAssets?.verifyForRelease !== "function") {
+            throw new ApiError(503, "MEDIA_VERIFICATION_UNAVAILABLE", "媒体字节验证服务尚未配置。");
+          }
+          await this.mediaAssets.verifyForRelease(row.publicSnapshot.assetRefs, state);
+          const aliasRows = this.#articleTakeoverAliases(state, row, route, item.draft.expectedPublicSnapshotHash);
+          candidates.push({ row, route, entry, aliasRows, content, base,
+            previousPublicSnapshotHash: item.draft.expectedPublicSnapshotHash });
+        } catch (error) {
+          if (error instanceof ApiError) error.details = { ...error.details, releaseId: entry.releaseId };
+          throw error;
+        }
+      }
+      if (!candidates.length) return JsonStore.noChange(alreadyActive);
+      if (new Set(candidates.map(({ row }) => row.canonicalPath)).size !== candidates.length) {
+        throw new ApiError(409, "RELEASE_ROUTE_CONFLICT", "同一分组只可激活同一网址的一篇修订。");
+      }
+      const manifest = candidates.map(({ row }) => ({ releaseId: row.id, canonicalPath: row.canonicalPath,
+        snapshotHash: row.snapshotHash, previousReleaseId: row.previousReleaseId }));
+      const backup = await this.beforeActivation.captureBatchCommitted(manifest, state);
+      const now = this.clock();
+      if (!backup || !/^EDB-[a-f0-9]{32}$/.test(backup.backupId) || backup.stage !== "pre_batch_activation" ||
+          hashObject(backup.candidates ?? null) !== hashObject(manifest) ||
+          !/^[a-f0-9]{64}$/.test(backup.manifestSha256) || !/^[a-f0-9]{64}$/.test(backup.stateSha256) ||
+          !Number.isSafeInteger(backup.assetCount) || backup.assetCount < 0 ||
+          !Number.isSafeInteger(backup.totalBytes) || backup.totalBytes < 0) {
+        throw new ApiError(503, "EDITORIAL_BACKUP_INVALID_RECEIPT", "批次备份没有返回准确候选的有效校验回执。");
+      }
+      const savedBackup = { backupId: backup.backupId, manifestSha256: backup.manifestSha256,
+        stateSha256: backup.stateSha256, assetCount: backup.assetCount, totalBytes: backup.totalBytes,
+        createdAt: timestamp(backup.createdAt, "backup.createdAt", now), stage: "pre_batch_activation" };
+      for (const candidate of candidates) {
+        const { row, route, entry, aliasRows, content, base, previousPublicSnapshotHash } = candidate;
+        try {
+          this.#assertEditorialAuthority(`release_activated:${row.id}`, inputFor(entry), entry.ctx, state);
+          this.#validatePublicCandidate(state, row, { now });
+          if (base) this.#assertOriginalReleaseReviewCurrent(state, row, content, now);
+        } catch (error) {
+          if (error instanceof ApiError) error.details = { ...error.details, releaseId: row.id };
+          throw error;
+        }
+        row.activationBackup = savedBackup;
+        if (previousPublicSnapshotHash) row.takeoverPreviousPublicSnapshotHash = previousPublicSnapshotHash;
+        if (aliasRows.length) row.articleMediaAliases = aliasRows;
+        route.activeReleaseId = row.id; route.revision += 1; route.withdrawnAt = null; route.updatedAt = now.toISOString();
+        row.status = "live_unverified"; row.activationAt = now.toISOString(); row.activatedBy = PUBLICATION_SYSTEM_ACTOR;
+        row.revision += 1; row.updatedAt = now.toISOString();
+      }
+      payload.backupId = backup.backupId;
+      return [...alreadyActive, ...candidates.map(({ row }) => entity(row))];
+    });
+    return result;
+  }
+
+  #articleTakeoverAliases(state, release, route, expected) {
+    const previous = record(state.websiteReleases, route.activeReleaseId, "RELEASE_NOT_FOUND");
+    const old = this.#publicDto(state, previous);
+    const projected = this.projectPublicArticle?.(old) ?? old;
+    if (projected.snapshotHash === old.snapshotHash && !expected) return [];
+    if (!expected || projected.snapshotHash !== expected || projected.snapshotHash === old.snapshotHash) {
+      throw new ApiError(409, "ARTICLE_TAKEOVER_PUBLIC_SNAPSHOT_CHANGED", "当前公开稿与授权接管的快照不一致。");
+    }
+    const preview = this.#publicDto(state, release, { privatePreview: true });
+    assertArticleTakeoverParity(projected, preview);
+    return projected.assets.map((legacy, index) => {
+      const replacement = preview.assets[index];
+      if (legacy.assetId !== `overlay-${legacy.sha256}` || legacy.sha256 !== replacement?.sha256) {
+        throw new ApiError(409, "ARTICLE_TAKEOVER_PARITY_MISMATCH", "旧媒体地址无法绑定到正式候选的相同图片。");
+      }
+      return { legacyAssetId: legacy.assetId, assetId: replacement.assetId, sha256: legacy.sha256 };
+    });
+  }
+
+  publicArticleMediaAlias(legacyAssetId, sha256) {
+    const state = this.#state();
+    for (const route of state.websiteRoutes) {
+      const release = state.websiteReleases.find(item => item.id === route.activeReleaseId);
+      const alias = release?.articleMediaAliases?.find(item => item.legacyAssetId === legacyAssetId && item.sha256 === sha256);
+      if (alias && this.#eligible(state, release)) {
+        return { ...alias, canonicalPath: release.canonicalPath, releaseId: release.id };
+      }
+    }
+    return null;
   }
 
   async publishRelease(id, input, ctx) {
@@ -1464,17 +1633,21 @@ export class EditorialService {
   async verifyRelease(id, input, ctx) {
     editorialInput(input, ["confirm"]);
     if (input.confirm !== true) throw new ApiError(400, "READBACK_CONFIRMATION_REQUIRED", "必须明确请求真实官网回读。");
-    const result = await this.#write(`release_verified:${id}`, input, ctx, async (state, { actor, ifMatch, now, payload }) => {
-      const row = record(state.websiteReleases, id, "RELEASE_NOT_FOUND"); assertMatch(row, ifMatch);
+    const current = (state, now) => {
+      const row = record(state.websiteReleases, id, "RELEASE_NOT_FOUND"); assertMatch(row, ctx.ifMatch);
       if (row.status !== "live_unverified") throw new ApiError(409, "INVALID_RELEASE_TRANSITION", "只有已激活且未验证的修订可入账。");
-      const route = state.websiteRoutes.find(item => item.activeReleaseId === id);
-      if (!route) throw new PolicyError("RELEASE_NOT_CURRENT", "修订已不是该正式 URL 的当前版本。");
+      if (!state.websiteRoutes.some(route => route.activeReleaseId === id)) {
+        throw new PolicyError("RELEASE_NOT_CURRENT", "修订已不是该正式 URL 的当前版本。");
+      }
       this.#validatePublicCandidate(state, row, { now, checkLive: true });
-      if (typeof this.verifyReadback !== "function") throw new ApiError(503, "WEBSITE_READBACK_UNAVAILABLE", "真实官网回读校验器尚未配置。");
-      const expected = this.#publicDto(state, row);
-      const proof = await this.verifyReadback(structuredClone(expected));
-      const verifiedNow = this.clock();
-      this.#validatePublicCandidate(state, row, { now: verifiedNow, checkLive: true });
+      return row;
+    };
+    const result = await this.#write(`release_verified:${id}`, input, ctx, (state, { actor, now: verifiedNow, payload, review }) => {
+      const row = current(state, verifiedNow);
+      const { expected, proof } = review;
+      if (this.#publicDto(state, row).etag !== expected.etag) {
+        throw new PolicyError("WEBSITE_READBACK_MISMATCH", "官网页面、正文快照或媒体字节没有通过真实回读。");
+      }
       const assets = [...new Map(expected.assets.map(asset => [`${asset.assetId}:${asset.sha256}`, { assetId: asset.assetId, sha256: asset.sha256 }])).values()]
         .sort((a, b) => a.assetId.localeCompare(b.assetId));
       if (!proof || proof.releaseId !== id || proof.snapshotHash !== row.snapshotHash || proof.canonicalUrl !== expected.canonicalUrl ||
@@ -1491,9 +1664,64 @@ export class EditorialService {
       const content = record(state.content, row.contentId, "CONTENT_NOT_FOUND");
       content.status = "published"; content.version += 1; content.websiteReleaseId = id; content.updatedAt = verifiedNow.toISOString();
       payload.releaseId = id; payload.receiptHash = row.receipt.receiptHash; return entity(row);
-    }, this.aiApproval ? async () => ({ effectActor: PUBLICATION_SYSTEM_ACTOR }) : null);
+    }, async (state, { now }) => {
+      const row = current(state, now);
+      if (typeof this.verifyReadback !== "function") throw new ApiError(503, "WEBSITE_READBACK_UNAVAILABLE", "真实官网回读校验器尚未配置。");
+      const expected = this.#publicDto(state, row);
+      const proof = await this.verifyReadback(structuredClone(expected));
+      return { expected, proof, ...(this.aiApproval ? { effectActor: PUBLICATION_SYSTEM_ACTOR } : {}) };
+    });
     const finalBackup = await this.geoService?.backupFinalContent(this.getVariant(result.contentId));
     return finalBackup ? { ...result, finalBackup } : result;
+  }
+
+  async rollbackRelease(id, input, ctx) {
+    editorialInput(input, ["expectedPreviousReleaseId", "reason"]);
+    const reason = editorialText(input.reason, "reason", 2000);
+    editorialId(input.expectedPreviousReleaseId);
+    return this.#write(`release_rolled_back:${id}`, input, ctx, async (state, { actor, ifMatch, payload }) => {
+      const current = record(state.websiteReleases, id, "RELEASE_NOT_FOUND"); assertMatch(current, ifMatch);
+      const route = state.websiteRoutes.find(item => item.canonicalPath === current.canonicalPath);
+      if (current.activationBackup?.stage !== "pre_batch_activation" || route?.activeReleaseId !== id ||
+          current.previousReleaseId !== input.expectedPreviousReleaseId) {
+        throw new ApiError(409, "RELEASE_ROUTE_CONFLICT", "只能回退仍活动的批次修订与其准确前版。");
+      }
+      const previous = record(state.websiteReleases, input.expectedPreviousReleaseId, "RELEASE_NOT_FOUND");
+      if (previous.canonicalPath !== route.canonicalPath || previous.storyId !== route.storyId ||
+          previous.status !== "published" || !previous.receipt || !this.#eligible(state, previous)) {
+        throw new PolicyError("RELEASE_ROLLBACK_UNAVAILABLE", "前一版本已不满足现有公开和回读条件。");
+      }
+      if (current.takeoverPreviousPublicSnapshotHash) {
+        const original = this.#publicDto(state, previous);
+        const projected = this.projectPublicArticle?.(original) ?? original;
+        if (projected.snapshotHash !== current.takeoverPreviousPublicSnapshotHash ||
+            await this.verifyRollbackProjection?.(projected) !== true) {
+          throw new ApiError(409, "ARTICLE_TAKEOVER_ROLLBACK_BUNDLE_REQUIRED", "当前无法核对接管前的实际图文，请先恢复已归档的直发内容包。");
+        }
+      }
+      if (previous.publicSnapshot.assetRefs.length) {
+        if (typeof this.mediaAssets?.verifyForRelease !== "function") {
+          throw new ApiError(503, "MEDIA_VERIFICATION_UNAVAILABLE", "回退前需要核对前一版本的实际媒体字节。");
+        }
+        await this.mediaAssets.verifyForRelease(previous.publicSnapshot.assetRefs, state);
+      }
+      const restoredAt = this.clock();
+      this.#validatePublicCandidate(state, previous, { checkLive: true, now: restoredAt });
+      route.activeReleaseId = previous.id; route.updatedAt = restoredAt.toISOString(); route.revision += 1;
+      current.status = "withdrawn"; current.withdrawal = { by: actor, at: restoredAt.toISOString(), reason };
+      current.revision += 1; current.updatedAt = restoredAt.toISOString();
+      for (const batch of state.revisionBatches ?? []) {
+        const item = batch.items.find(row => row.releaseId === id);
+        if (!item) continue;
+        item.status = "rolled_back"; item.stage = "rollback"; item.operation = null; item.reviewPolling = null;
+        item.error = null; item.updatedAt = restoredAt.toISOString();
+        item.rollback = { restoredReleaseId: previous.id, at: item.updatedAt };
+        batch.revision += 1; batch.updatedAt = item.updatedAt;
+        break;
+      }
+      Object.assign(payload, { releaseId: id, restoredReleaseId: previous.id });
+      return { ...entity(current), restoredReleaseId: previous.id };
+    });
   }
 
   async withdrawRelease(id, input, ctx) {

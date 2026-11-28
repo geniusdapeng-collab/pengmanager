@@ -67,6 +67,27 @@ function reviewEvent(payload) {
     && payload.rule_impact?.some(item => item.rule_id === RULE && item.result === 'review');
 }
 
+function pendingMalformedVerdictRetry(review, failure, events) {
+  const payload = failure?.payload;
+  const detail = payload?.decision?.after;
+  if (review?.status !== 'pending' || !(Date.parse(review.expires_at) > Date.now()) ||
+      payload?.decision?.action !== 'approval.ai_attempt_unresolved' ||
+      detail?.reasonCode !== 'NATIVE_APPROVAL_VERDICT_INVALID' || payload.object?.type !== 'review' ||
+      payload.object.id !== review.event_id || BigInt(failure.seq) <= BigInt(review.review_seq)) return false;
+  const attempts = events.filter(row => row.payload.decision?.action === 'approval.ai_attempt_started' &&
+    row.payload.decision.after?.approvalId === review.approval_id && BigInt(row.seq) > BigInt(review.review_seq));
+  const previous = attempts.at(-1), started = previous?.payload;
+  const original = started?.decision.after;
+  return Boolean(started?.who?.type === 'system' && started.who.id === 'review-console' &&
+    started.object?.type === 'review' && started.object.id === review.event_id && started.links?.includes(review.event_id) &&
+    payload.links?.includes(review.event_id) && payload.links.includes(previous.event_id) && BigInt(previous.seq) < BigInt(failure.seq) &&
+    detail.authority === 'ai' && original.authority === 'ai' && detail.workerInstance === original.workerInstance &&
+    typeof original.workerInstance === 'string' && detail.evidenceHash === original.evidenceHash &&
+    SHA.test(original.evidenceHash ?? '') && SHA.test(original.bindingHash ?? '') &&
+    (!Object.hasOwn(detail, 'bindingHash') || detail.bindingHash === original.bindingHash && detail.providerReceipt?.provider === 'openai') &&
+    !attempts.some(row => Object.hasOwn(row.payload.decision.after, 'malformedVerdictRetryOf')));
+}
+
 function realExecution(row, action, step) {
   const event = row.payload;
   return event?.who?.type === 'agent' && event.who.id === PRESET && event?.decision?.kind === 'execute'
@@ -303,7 +324,7 @@ async function loadScene(pool, binding) {
     require(threadMatches(thread, binding), 'ARTICLE_SCENE_BINDING_CONFLICT', '原生任务与插图计划绑定不一致。');
     const { rows: events } = await client.query(`SELECT event_id,seq,payload FROM biz_events
       WHERE tenant_id=$1 AND workspace_id=$2 AND session_id=$3 ORDER BY seq LIMIT 101`, args);
-    const { rows: reviews } = await client.query(`SELECT a.approval_id,a.event_id,a.status,a.decided_by,
+    const { rows: reviews } = await client.query(`SELECT a.approval_id,a.event_id,a.status,a.decided_by,a.snapshot->>'expires_at' AS expires_at,
       e.seq AS review_seq,e.payload AS review_payload,h.event_id AS gesture_event_id,h.seq AS gesture_seq,h.payload AS gesture_payload
       FROM approvals a JOIN biz_events e ON e.tenant_id=a.tenant_id AND e.workspace_id=a.workspace_id AND e.event_id=a.event_id
       LEFT JOIN biz_events h ON h.tenant_id=a.tenant_id AND h.workspace_id=a.workspace_id
@@ -340,12 +361,14 @@ export function createArticleVisuals({ dataRoot, outRoot, active, assertComposit
   const read = binding => query(pool=>loadScene(pool,binding));
   function status(binding, scene) {
     const review = scene?.review;
-    const ai = scene?.events.findLast(row => row.payload?.who?.type === 'system' && row.payload.who.id === 'review-console' &&
-      /^approval\.ai_/.test(row.payload.decision?.action ?? '') && row.payload.decision?.after?.approvalId === review?.approval_id)?.payload;
+    const aiEvent = scene?.events.findLast(row => row.payload?.who?.type === 'system' && row.payload.who.id === 'review-console' &&
+      /^approval\.ai_/.test(row.payload.decision?.action ?? '') && row.payload.decision?.after?.approvalId === review?.approval_id);
+    const ai = aiEvent?.payload;
     return { nativeThreadId: binding.threadId, state: scene?.thread.status ?? 'missing',
       approval: reviewEvent(review?.review_payload) ? { id: review.approval_id, status: review.status,
         ...(ai ? { ai: { event: ai.decision.action, outcome: ai.decision.after.outcome ?? null,
           reason: ai.decision.after.reason ?? ai.decision.after.reasonCode ?? null, at: ai.context?.time ?? null,
+          ...(pendingMalformedVerdictRetry(review, aiEvent, scene.events) ? { recoveryPending: true } : {}),
           ...(ai.decision.after.retryAt ? { retryAt: ai.decision.after.retryAt } : {}) } } : {}) } : null };
   }
   return async (action, input) => {

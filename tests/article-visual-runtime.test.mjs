@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { hashObject } from '../src/domain/hash.mjs';
-import { articleSceneBinding, articleSceneFraming, articleSceneProof, articleSceneStatement, articleSceneWorkOrder } from '../src/video-runtime/article-visuals.mjs';
+import { articleSceneBinding, articleSceneFraming, articleSceneProof, articleSceneStatement, articleSceneWorkOrder, createArticleVisuals } from '../src/video-runtime/article-visuals.mjs';
 import { articleIllustrationSceneBriefHash, validateIllustrationEvidence } from '../src/domain/article-illustrations.mjs';
 import { createWorkbenchServer } from '../src/video-runtime/web.mjs';
 import { parseVideoArgs } from '../scripts/video-cli.mjs';
@@ -158,6 +158,50 @@ test('scene proof rejects old or different threads, simulated receipts, altered 
     [f => { f.sourceSha = 'd'.repeat(64); }, 'ARTICLE_SCENE_BYTES_CHANGED'],
     [f => { f.review.review_payload.decision.params.overlay_asset_sha256 = 'e'.repeat(64); }, 'ARTICLE_SCENE_BYTES_CHANGED'],
   ]) assert.throws(() => articleSceneStatement(change(alter)), { code });
+});
+
+test('scene status follows only the original receipt-verified malformed verdict for automatic recovery', async () => {
+  const { thread, review, binding } = ledgerFixture();
+  thread.status = 'pending_review';
+  review.status = 'pending';
+  review.expires_at = new Date(Date.now() + 60_000).toISOString();
+  const attempt = { authority: 'ai', workerInstance: 'original-worker', evidenceHash: 'd'.repeat(64), bindingHash: 'e'.repeat(64) };
+  const { bindingHash, ...legacyFailure } = attempt;
+  const invalidCode = 'NATIVE_APPROVAL_VERDICT_INVALID';
+  const row = (number, action, after, links) => ({ event_id: `E-${number}`, seq: String(number), payload: {
+    who: { type: 'system', id: 'review-console' }, object: { type: 'review', id: review.event_id }, links,
+    decision: { action, after: { approvalId: review.approval_id, ...after } } } });
+  const started = row(2, 'approval.ai_attempt_started', attempt, ['E-1']);
+  const failure = details => row(3, 'approval.ai_attempt_unresolved', details, ['E-1', 'E-2']);
+  let events;
+  const scene = createArticleVisuals({ active: () => true, connect: () => ({
+    async connect() { return { async query(sql) {
+      if (sql.includes('FROM threads')) return { rows: [thread] };
+      if (sql.includes('SELECT event_id')) return { rows: events };
+      if (sql.includes('FROM approvals')) return { rows: [review] };
+      return { rows: [] };
+    }, release() {} }; },
+    async end() {},
+  }) });
+  const status = async () => (await scene('status', binding)).approval.ai;
+  events = [started, failure({ ...legacyFailure, reasonCode: invalidCode })];
+  assert.equal((await status()).recoveryPending, true);
+  const expiresAt = review.expires_at;
+  review.expires_at = "2000-01-01T00:00:00.000Z";
+  assert.equal((await status()).recoveryPending, undefined);
+  review.expires_at = expiresAt;
+  events = [started, failure({ ...attempt, reasonCode: invalidCode, providerReceipt: { provider: 'openai' } })];
+  assert.equal((await status()).recoveryPending, true);
+  events = [started, failure({ ...attempt, reasonCode: invalidCode, providerReceipt: { provider: 'deepseek' } })];
+  assert.equal((await status()).recoveryPending, undefined);
+  events = [started, failure({ ...attempt, reasonCode: invalidCode })];
+  assert.equal((await status()).recoveryPending, undefined);
+  events = [started, failure({ ...legacyFailure, reasonCode: 'MODEL_RESPONSE_UNKNOWN' })];
+  assert.equal((await status()).recoveryPending, undefined);
+  events = [started, failure({ ...legacyFailure, reasonCode: invalidCode }),
+    row(4, 'approval.ai_attempt_started', { ...attempt, malformedVerdictRetryOf: 'E-3' }, ['E-1', 'E-2', 'E-3']),
+    row(5, 'approval.ai_attempt_unresolved', { ...attempt, reasonCode: invalidCode, providerReceipt: { provider: 'openai' } }, ['E-1', 'E-4'])];
+  assert.equal((await status()).recoveryPending, undefined);
 });
 
 test('workbench scene handoff requires its HttpOnly cookie, current origin and CSRF', async t => {

@@ -105,14 +105,14 @@ function validateRequestSource(request, allowedHosts) {
   }
 }
 
-async function readJsonBody(request) {
+async function readJsonBody(request, maxBytes = 1_000_000) {
   const chunks = [];
   let size = 0;
 
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 1_000_000) {
-      throw new ApiError(413, "BODY_TOO_LARGE", "请求体超过 1 MB。");
+    if (size > maxBytes) {
+      throw new ApiError(413, "BODY_TOO_LARGE", `请求体超过 ${maxBytes / 1_000_000} MB。`);
     }
     chunks.push(chunk);
   }
@@ -251,10 +251,14 @@ export function createGeoOsServer({
   productionArtifacts,
   workloomLaunch,
   aiApproval,
+  revisionBatches,
+  articleOverlay,
   publicWebsite = false,
   mediaRenderEnabled = true,
 }) {
-  const routeWebsite = createPublicWebsite({ publicDir, editorial, service, securityHeaders });
+  const publicEditorial = articleOverlay?.editorial ?? editorial;
+  const publicMediaAssets = articleOverlay?.mediaAssets ?? mediaAssets;
+  const routeWebsite = createPublicWebsite({ publicDir, editorial: publicEditorial, service, securityHeaders });
   let shuttingDown = false;
   const server = createServer(async (request, response) => {
     try {
@@ -287,8 +291,8 @@ export function createGeoOsServer({
         writeJson(response, 200, service.publicPreview());
         return;
       }
-      if (routePublicContentApi({ request, response, url, editorial, writeJson, methodNotAllowed })) return;
-      if (await routePublicMedia({ request, response, url, mediaAssets, methodNotAllowed })) return;
+      if (routePublicContentApi({ request, response, url, editorial: publicEditorial, writeJson, methodNotAllowed })) return;
+      if (await routePublicMedia({ request, response, url, mediaAssets: publicMediaAssets, methodNotAllowed })) return;
 
       if (path === "/api/auth/status") {
         if (request.method !== "GET") {
@@ -389,7 +393,7 @@ export function createGeoOsServer({
         writeJson, methodNotAllowed })) return;
       if (await routeContentDirector({ request, response, url, principal, contentDirector, readJsonBody,
         writeJson, methodNotAllowed })) return;
-      if (await routeEditorialApi({ request, response, url, principal, editorial, mediaAssets, aiApproval,
+      if (await routeEditorialApi({ request, response, url, principal, editorial, mediaAssets, aiApproval, revisionBatches,
         readJsonBody, writeJson, writeEditorialBootstrap, methodNotAllowed })) return;
       if (path === "/api/workloom/launch") {
         if (request.method !== "POST") { methodNotAllowed(response, ["POST"]); return; }

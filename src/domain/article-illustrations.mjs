@@ -6,6 +6,7 @@ import { hashObject } from "./hash.mjs";
 import { genericProductNamingErrorCode, genericProductNamingFindings, normalizeGeneratedTextContent } from "./product-naming.mjs";
 
 export const ARTICLE_ILLUSTRATION_SCHEMA = "pengmanager.article-illustrations/v1";
+export const ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY = "diagram-pair-v1";
 const SHA = /^[a-f0-9]{64}$/;
 const OPAQUE_ID = /^[a-zA-Z0-9_.:-]{1,120}$/;
 const ARTICLE_TYPES = new Set(["technical", "product", "lifestyle"]);
@@ -99,10 +100,30 @@ export function articleIllustrationSourceHash({ locale, title, summary, body }) 
   return hashObject({ locale, title, summary, body });
 }
 
+function validIllustrationPolicy(illustrationPolicy, baseReleaseId) {
+  return illustrationPolicy === undefined ||
+    (illustrationPolicy === ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY && baseReleaseId === undefined);
+}
+
+function diagramPairMatches(articleType, slots) {
+  return (articleType === "technical" || articleType === "product") &&
+    Array.isArray(slots) && slots.length === 2 &&
+    slots.some(slot => slot?.kind === "architecture") && slots.some(slot => slot?.kind === "logic");
+}
+
 export function normalizeArticleIllustrationPlan(input, article, suggestion = suggestArticleIllustrations(article)) {
   const articleType = input.articleType ?? suggestion.articleType;
   if (!ARTICLE_TYPES.has(articleType)) fail("ILLUSTRATION_ARTICLE_TYPE_INVALID", "请选择产品、技术或生活分享文章。");
-  if (!Array.isArray(input.slots) || input.slots.length < 3 || input.slots.length > MAX_SLOTS) {
+  const { illustrationPolicy } = input;
+  if (!validIllustrationPolicy(illustrationPolicy, input.baseReleaseId)) {
+    fail("ILLUSTRATION_POLICY_INVALID", "配图规则无效，原文加图仍须使用原配图规则。");
+  }
+  const diagramPair = illustrationPolicy === ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY;
+  if (diagramPair) {
+    if (!diagramPairMatches(articleType, input.slots)) {
+      fail("ILLUSTRATION_COVERAGE_REQUIRED", "双图规则只用于技术或产品稿，须各有一张架构图和逻辑图。");
+    }
+  } else if (!Array.isArray(input.slots) || input.slots.length < 3 || input.slots.length > MAX_SLOTS) {
     fail("ILLUSTRATION_SLOT_COUNT", `每篇文章至少安排 3 张不同的配图，单篇引用上限为 ${MAX_SLOTS} 张。`);
   }
   const anchors = new Set(), descriptions = new Set(), alternatives = new Set();
@@ -130,19 +151,21 @@ export function normalizeArticleIllustrationPlan(input, article, suggestion = su
     };
   });
   const kinds = new Set(slots.map(slot => slot.kind));
-  if (articleType === "lifestyle" ? kinds.size !== 1 || !kinds.has("scene") : [...SLOT_KINDS].some(kind => !kinds.has(kind))) {
+  if (!diagramPair && (articleType === "lifestyle" ? kinds.size !== 1 || !kinds.has("scene") : [...SLOT_KINDS].some(kind => !kinds.has(kind)))) {
     fail("ILLUSTRATION_COVERAGE_REQUIRED", articleType === "lifestyle"
       ? "生活分享文章需要至少三张对应正文内容的场景图。"
       : "产品或技术文章需分别有架构图、逻辑图和场景图。");
   }
-  return { articleType, suggestion, slots, sourceHash: articleIllustrationSourceHash(article) };
+  return { articleType, suggestion, slots, sourceHash: articleIllustrationSourceHash(article),
+    ...(diagramPair ? { illustrationPolicy } : {}) };
 }
 
 export function articleIllustrationPlanHash(plan) {
   return hashObject({ schema: plan.schema, id: plan.id, storyId: plan.storyId,
     locale: plan.locale, sourceHash: plan.sourceHash, articleType: plan.articleType, slots: plan.slots,
     ...(plan.baseReleaseId !== undefined ? { baseReleaseId: plan.baseReleaseId } : {}),
-    ...(plan.styleYear !== undefined ? { styleYear: plan.styleYear } : {}) });
+    ...(plan.styleYear !== undefined ? { styleYear: plan.styleYear } : {}),
+    ...(plan.illustrationPolicy !== undefined ? { illustrationPolicy: plan.illustrationPolicy } : {}) });
 }
 
 export function assertArticleIllustrationStateIntegrity(state) {
@@ -162,8 +185,11 @@ export function assertArticleIllustrationStateIntegrity(state) {
   for (const plan of plans) {
     if (!plan || !/^ILP-\d{5,}$/u.test(plan.id ?? "") || plan.schema !== ARTICLE_ILLUSTRATION_SCHEMA ||
         !state.stories.some(story => story.id === plan.storyId) || !ARTICLE_TYPES.has(plan.articleType) ||
-        !SHA.test(plan.sourceHash ?? "") || !Array.isArray(plan.slots) || plan.slots.length < 3 || plan.slots.length > MAX_SLOTS ||
-        plansById.has(plan.id)) invalid();
+        !SHA.test(plan.sourceHash ?? "") || !Array.isArray(plan.slots) || plansById.has(plan.id) ||
+        !validIllustrationPolicy(plan.illustrationPolicy, plan.baseReleaseId)) invalid();
+    if (plan.illustrationPolicy === ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY
+      ? !diagramPairMatches(plan.articleType, plan.slots)
+      : plan.slots.length < 3 || plan.slots.length > MAX_SLOTS) invalid();
     if (plan.styleYear !== undefined && !isArticleIllustrationStyleYear(plan.styleYear)) invalid();
     if (plan.baseReleaseId !== undefined &&
         (typeof plan.baseReleaseId !== "string" || !/^REL-\d{5,}$/u.test(plan.baseReleaseId) ||
@@ -353,7 +379,16 @@ export function assertArticleIllustrations(state, plan, article, { exactSource =
     fail("ARTICLE_ILLUSTRATION_PLAN_REQUIRED", "官网文章需绑定本选题、同语言、准确母稿的配图计划。更换母稿后请重新准备。");
   }
   const assets = new Set(), hashes = new Set(), fingerprints = new Set(), proofs = new Set();
-  if (plan.slots.length < 3 || plan.slots.length > MAX_SLOTS) fail("ILLUSTRATION_SLOT_COUNT", "官网文章至少需要三张不同的配图。");
+  if (!validIllustrationPolicy(plan.illustrationPolicy, plan.baseReleaseId)) {
+    fail("ILLUSTRATION_POLICY_INVALID", "当前配图规则无效。");
+  }
+  if (plan.illustrationPolicy === ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY) {
+    if (!diagramPairMatches(plan.articleType, plan.slots)) {
+      fail("ILLUSTRATION_COVERAGE_REQUIRED", "双图规则只用于技术或产品稿，须各有一张架构图和逻辑图。");
+    }
+  } else if (plan.slots.length < 3 || plan.slots.length > MAX_SLOTS) {
+    fail("ILLUSTRATION_SLOT_COUNT", "官网文章至少需要三张不同的配图。");
+  }
   for (const slot of plan.slots) {
     const evidence = slot.evidence;
     if (!evidence) fail("ARTICLE_ILLUSTRATION_INCOMPLETE", "请完成配图、真实凭据上传和素材权利审核后再创建公开修订。", { slotId: slot.id });

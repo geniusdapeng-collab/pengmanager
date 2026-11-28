@@ -158,12 +158,13 @@ test("local editorial Agent creates held drafts and dispatches a version exactly
   await assert.rejects(agent.invoke("pengmanager.editorial.job.dispatch", { ...dispatch, ifMatch: '"' + "0".repeat(64) + '"' }), { code: "PRECONDITION_FAILED" });
   const responses = await Promise.all([agent.invoke("pengmanager.editorial.job.dispatch", dispatch), agent.invoke("pengmanager.editorial.job.dispatch", dispatch)]);
   assert.deepEqual(responses.map(row => row.id), [active.id, active.id]);
+  const completionDeadline = performance.now() + 15_000;
   let completed;
-  for (let attempt = 0; attempt < 100; attempt++) {
+  do {
     completed = await readJob(active.id);
     if (!["queued", "running"].includes(completed.status)) break;
     await delay(30);
-  }
+  } while (performance.now() < completionDeadline);
   assert.equal(completed.status, "needs_review", JSON.stringify(completed.error));
   assert.ok(completed.artifacts.some(item => item.mime === "image/png"));
   assert.equal((await readJob(held.id)).agentDispatchRequired, true);

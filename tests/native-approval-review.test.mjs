@@ -51,6 +51,7 @@ function responseFor(prepared, edits = {}) {
   receipt: { schemaVersion: 'workloom.model-receipt/v1', policy: { scene: 'approval.native' }, registry: { provider: 'openai' },
     requestedModel: 'gpt-6.2-sol', returnedModel: 'gpt-6.2-sol', finishReason: 'stop', responseId: 'isolated-model-response',
     requestHash: '1'.repeat(64), responseHash: '2'.repeat(64), contentHash: '3'.repeat(64), policyHash: '4'.repeat(64),
+    wireSha256: '5'.repeat(64),
     usage: { inputTokens: 970, outputTokens: 55, totalTokens: 1025 } } };
 }
 
@@ -73,14 +74,32 @@ test('native AI receives the byte-bound crop and overlay through the structured 
   const verdict = await reviewer.review(prepared);
   assert.equal(verdict.providerReceipt.model, 'gpt-6.2-sol');
   assert.equal(verdict.outcome, 'approve');
-  response = responseFor(prepared, { evidenceHash: 'e'.repeat(64) });
-  await assert.rejects(reviewer.review(prepared), { code: 'NATIVE_APPROVAL_VERDICT_INVALID' });
-  response = responseFor(prepared, { checks: { sceneFit: false, framing: true, readability: true, visualSafety: true } });
-  await assert.rejects(reviewer.review(prepared), { code: 'NATIVE_APPROVAL_VERDICT_INVALID' });
+  const failedChecks = { sceneFit: false, framing: true, readability: true, visualSafety: true };
+  for (const edits of [{ evidenceHash: 'e'.repeat(64) }, { checks: failedChecks }]) {
+    response = responseFor(prepared, edits);
+    await assert.rejects(reviewer.review(prepared), error => {
+      assert.equal(error.code, 'NATIVE_APPROVAL_VERDICT_INVALID');
+      assert.deepEqual(error.providerReceipt, verdict.providerReceipt);
+      assert.equal(error.wireSha256, response.receipt.wireSha256);
+      assert.equal('value' in error, false);
+      return true;
+    });
+  }
+  for (const outcome of ['reject', 'needs_input']) {
+    response = responseFor(prepared, { outcome, checks: failedChecks });
+    assert.equal((await reviewer.review(prepared)).outcome, outcome);
+  }
   response = responseFor(prepared);
   delete response.receipt.usage;
+  await assert.rejects(reviewer.review(prepared), error => {
+    assert.equal(error.code, 'NATIVE_APPROVAL_RECEIPT_INVALID');
+    assert.equal('providerReceipt' in error, false);
+    return true;
+  });
+  response = responseFor(prepared, { evidenceHash: 'e'.repeat(64) });
+  response.receipt.registry.provider = 'deepseek';
   await assert.rejects(reviewer.review(prepared), { code: 'NATIVE_APPROVAL_RECEIPT_INVALID' });
-  assert.equal(called, 4);
+  assert.equal(called, 7);
   await writeFile(sourcePath, await sharp({ create: { width: 512, height: 384, channels: 3, background: '#983e23' } }).png().toBuffer());
   await assert.rejects(reviewer.prepare(record), { code: 'ARTICLE_SCENE_BYTES_CHANGED' });
   await assert.rejects(reviewer.prepare({ ...record, workspaceId: 'foreign-workspace' }), { code: 'NATIVE_APPROVAL_SCOPE_INVALID' });

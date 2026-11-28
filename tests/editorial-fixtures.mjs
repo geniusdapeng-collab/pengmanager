@@ -24,6 +24,11 @@ export async function editorialFixture(t, { verifier = true, mediaAssets, before
   const store = new JsonStore({ filePath: join(directory, "state.json"), clock });
   t.after(async () => { await store.close(); await rm(directory, { recursive: true, force: true }); });
   const seed = await loadSeedState(join(ROOT, "data/seed"));
+  seed.claims.push({
+    id: "C003", type: "project", text: "Node.js 是 JavaScript 运行时。",
+    source: { label: "Node.js 官网", visibility: "public", url: "https://nodejs.org/" },
+    evidenceLevel: "B", state: "draft", publicLevel: "private", sensitivity: "low", expiresAt: null,
+  });
   if (seedTransform) seedTransform(seed);
   await store.open(async () => seed);
   await migrateEditorialState(store, { publicOrigin: "https://pengmanager.com", clock });

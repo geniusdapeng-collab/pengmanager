@@ -4,11 +4,13 @@ import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { articleIllustrationStyleYear } from "../public/article-illustration-style.js";
 import { articleIllustrationImageGenPrompt } from "../public/article-illustration-work-order.js";
+import { placeArticleIllustrations as placeIllustrationsInBrowser } from "../public/article-illustrations.js";
 import { articleSceneWorkOrder } from "../src/video-runtime/article-visuals.mjs";
 import { originalIllustrationCriteria } from "../src/services/editorial-article-review-evidence.mjs";
 import { hashObject } from "../src/domain/hash.mjs";
-import { ARTICLE_ILLUSTRATION_SCHEMA, articleIllustrationPlanHash, articleIllustrationSourceHash,
-  assertArticleIllustrationStateIntegrity, placeArticleIllustrations, sceneBriefHashForPlan } from "../src/domain/article-illustrations.mjs";
+import { ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY, ARTICLE_ILLUSTRATION_SCHEMA, articleIllustrationPlanHash, articleIllustrationSourceHash,
+  assertArticleIllustrations, assertArticleIllustrationStateIntegrity, normalizeArticleIllustrationPlan,
+  placeArticleIllustrations, sceneBriefHashForPlan, suggestArticleIllustrations } from "../src/domain/article-illustrations.mjs";
 import { approvedRelease, context, createEditionVariant, editorialFixture, FIXED_TIME, readyWebsite, scheduleVariant } from "./editorial-fixtures.mjs";
 import { bindFixtureIllustrations, fixtureIllustrationProof, registerFixtureIllustrator,
   syntheticIllustrationPng, uploadFixtureIllustration } from "./fixtures/article-illustrations.mjs";
@@ -75,6 +77,47 @@ test("a plan can freeze an exact article release while preserving the legacy dig
     assert.throws(() => assertArticleIllustrationStateIntegrity({ ...boundState, websiteReleases: [release] }), invalid);
   }
   assert.throws(() => assertArticleIllustrationStateIntegrity({ ...boundState, editions: [edition] }), invalid);
+});
+
+test("a versioned diagram pair is bound to its digest and only permits two exact diagram types", () => {
+  const illustrationPolicy = ARTICLE_ILLUSTRATION_DIAGRAM_PAIR_POLICY;
+  const slots = suggestArticleIllustrations(article).slots.filter(slot => slot.kind !== "scene");
+  const input = { articleType: "technical", illustrationPolicy, slots };
+  const plan = { ...normalizeArticleIllustrationPlan(input, article), schema: ARTICLE_ILLUSTRATION_SCHEMA,
+    id: "ILP-00001", storyId: "STY-00001", locale: article.locale };
+  const articleWithStory = { ...article, storyId: plan.storyId, format: "article" };
+  const edition = { ...articleWithStory, illustrationPlanId: plan.id, illustrationPlanHash: articleIllustrationPlanHash(plan) };
+  const state = { schemaVersion: 4, stories: [{ id: plan.storyId }], articleIllustrationPlans: [plan], editions: [edition], mediaAssets: [] };
+  assert.equal(plan.illustrationPolicy, illustrationPolicy);
+  assert.notEqual(edition.illustrationPlanHash, articleIllustrationPlanHash({ ...plan, illustrationPolicy: undefined }));
+  assert.doesNotThrow(() => assertArticleIllustrationStateIntegrity(state));
+  assert.throws(() => assertArticleIllustrationStateIntegrity({ ...state, articleIllustrationPlans: [{ ...plan, illustrationPolicy: undefined }] }),
+    { code: "STATE_ARTICLE_ILLUSTRATION_INVALID" });
+  assert.throws(() => assertArticleIllustrations(state, plan, articleWithStory, { exactSource: true }),
+    { code: "ARTICLE_ILLUSTRATION_INCOMPLETE" });
+  assert.throws(() => normalizeArticleIllustrationPlan({ ...input, illustrationPolicy: undefined }, article),
+    { code: "ILLUSTRATION_SLOT_COUNT" });
+  for (const invalid of [
+    { ...input, articleType: "lifestyle" },
+    { ...input, slots: [...slots, { ...slots[0], kind: "scene" }] },
+    { ...input, slots: [slots[0], { ...slots[1], kind: "scene" }] },
+  ]) {
+    assert.throws(() => normalizeArticleIllustrationPlan(invalid, article), { code: "ILLUSTRATION_COVERAGE_REQUIRED" });
+  }
+  for (const invalid of [
+    { ...input, illustrationPolicy: "diagram-pair-v2" },
+    { ...input, baseReleaseId: "REL-00001" },
+  ]) {
+    assert.throws(() => normalizeArticleIllustrationPlan(invalid, article), { code: "ILLUSTRATION_POLICY_INVALID" });
+  }
+
+  const assets = plan.slots.map((slot, index) => ({ id: `diagram-${index}`, sha256: String(index).repeat(64),
+    kind: "image", status: "reviewed" }));
+  const boundPlan = { ...plan, isComplete: true, slots: plan.slots.map((slot, index) => ({
+    ...slot, evidence: { assetId: assets[index].id, sha256: assets[index].sha256 },
+  })) };
+  assert.equal(placeIllustrationsInBrowser(blocks, [], boundPlan, assets).references.length, 2);
+  assert.throws(() => placeIllustrationsInBrowser(blocks, [], { ...boundPlan, illustrationPolicy: undefined }, assets), /至少三张配图/u);
 });
 
 test("suggestions distinguish three article types and point to body excerpts", async t => {

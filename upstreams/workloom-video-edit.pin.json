@@ -6,6 +6,6 @@
   "sourceFileCount": 3650,
   "distribution": "public-source",
   "snapshot": "upstreams/workloom-video-edit.snapshot.json",
-  "snapshotSha256": "4c1de8a2630ce826569cdaa9fe8e577d7b2efec559b8454292ba1f122fb14323",
+  "snapshotSha256": "70aba49632802d3e3c656f529b2ed8e698b7f6cfb41a7f3f7985c0c039ada7ac",
   "capabilityCatalog": "engines/video-edit/pengmanager-capabilities.json"
 }

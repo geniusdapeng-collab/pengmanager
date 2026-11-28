@@ -4,6 +4,7 @@ import { articleIllustrationImageGenPrompt, articleIllustrationWorkOrder } from 
 const TYPES = { technical: "技术文章", product: "产品文章", lifestyle: "生活分享" };
 const KINDS = { architecture: "架构图", logic: "逻辑图", scene: "场景图" };
 const PROOF_FIELDS = { "pengmanager-designer-compositor": "designerCompositor", "codex-imagegen": "imageGen" };
+const DIAGRAM_PAIR_POLICY = "diagram-pair-v1";
 const draftKinds = type => type === "lifestyle" ? ["scene", "scene", "scene"] : ["architecture", "logic", "scene"];
 const MAX_SLOTS = 64;
 const field = (scope, name) => scope.querySelector(`[name="${name}"]`);
@@ -71,8 +72,13 @@ export async function readArticleIllustrationProofs(files) {
 }
 
 export function placeArticleIllustrations(blocks, references, plan, assets) {
-  if (plan.isComplete !== true || !Array.isArray(plan.slots) || plan.slots.length < 3) {
-    throw new Error("请先完成至少三张配图，上传审核后的文件并核对对应回执。");
+  const diagramPair = plan.illustrationPolicy === DIAGRAM_PAIR_POLICY && plan.baseReleaseId === undefined &&
+    (plan.articleType === "technical" || plan.articleType === "product") && Array.isArray(plan.slots) &&
+    plan.slots.length === 2 && plan.slots.some(slot => slot?.kind === "architecture") && plan.slots.some(slot => slot?.kind === "logic");
+  if (plan.illustrationPolicy !== undefined && !diagramPair) throw new Error("当前计划的配图规则无效，请重新核对。");
+  if (plan.isComplete !== true || !Array.isArray(plan.slots) || (!diagramPair && plan.slots.length < 3)) {
+    throw new Error(diagramPair ? "请先完成架构图和逻辑图，上传审核后的文件并核对对应回执。"
+      : "请先完成至少三张配图，上传审核后的文件并核对对应回执。");
   }
   const positions = new Map();
   const planned = new Set();
@@ -175,6 +181,7 @@ export function createArticleIllustrationControls(root, { api, mutate, getAssets
     const completed = plan.slots.filter(slot => slot.evidence).length;
     const reviewed = getAssets().filter(asset => asset.status === "reviewed" && asset.kind === "image");
     output.innerHTML = `<h4>配图回执 ${completed}/${plan.slots.length}</h4>
+      ${plan.illustrationPolicy === DIAGRAM_PAIR_POLICY ? "<p>本修订采用两张图解规则，须绑定已审核的架构图和逻辑图。</p>" : ""}
       ${plan.styleYear === undefined ? "" : `<p>本计划必须采用 ${html(plan.styleYear)} 年起的当代风格。各类图片的要求随工单提供。</p>`}
       <ol class="editorial-reference-list">${plan.slots.map(slot => `<li>
         <strong>${html(KINDS[slot.kind])} · ${html(slot.anchor)}</strong>

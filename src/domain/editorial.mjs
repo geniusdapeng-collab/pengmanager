@@ -17,7 +17,8 @@ export const EDITORIAL_FORMATS = Object.freeze(["article", "image_text", "video"
 const SECRET_FIELD = /^(?:cookies?|passwords?|secrets?|(?:access[_-]?)?tokens?|api[_-]?key|authorization|credentials|storage[_-]?state|local[_-]?storage|session[_-]?storage|headers)$/i;
 const ASSET_ROLES = new Set(["cover", "image", "video", "poster", "subtitle"]);
 const ROLE_KINDS = { cover: "image", image: "image", video: "video", poster: "image", subtitle: "caption" };
-const HASH_FIELDS = new Set(["hash", "sha256", "snapshotHash", "editorialSnapshotHash", "editionSnapshotHash", "approvedSnapshotHash", "contentHash", "manifestSha256", "stateSha256",
+const HASH_FIELDS = new Set(["hash", "sha256", "snapshotHash", "editorialSnapshotHash", "editionSnapshotHash", "baseSnapshotHash",
+  "expectedPublicSnapshotHash", "approvedSnapshotHash", "contentHash", "manifestHash", "manifestSha256", "stateSha256",
   "packageHash", "nativePackageHash", "reviewSnapshotHash", "reportHash", "checkContextHash", "taskHash", "resolvedInputHash", "scopeHash", "pricingSnapshotHash",
   "lineageHash", "authorizationHash", "rightsReviewHash", "privacyReviewHash", "blueprintHash", "compiledBlueprintHash",
   "fingerprint", "checkedPackageHash", "adaptationPlanHash", "planHash", "compileInputHash", "sourceBundleHash", "formatTransformKey", "transformSpecHash"]);
