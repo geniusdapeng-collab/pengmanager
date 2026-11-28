@@ -5,6 +5,7 @@ import { createArticleIllustrationControls, placeArticleIllustrations, readArtic
 import { mountArticleIllustrationBatch } from "./article-illustration-batch.js";
 import { mountEditorialBatchMedia } from "./editorial-batch-media.js";
 import { mountEditorialBatchEdition } from "./editorial-batch-edition.js";
+import { mountEditorialRevisionBatches } from "./editorial-revision-batches.js";
 
 const STATUS = { draft: "草稿", active: "已启用", paused: "已暂停", archived: "已归档", unverified: "待核对", verified: "身份已核对", fact_check: "事实核验中", approved: "此版本已批准", scheduled: "已排期", candidate: "私有候选", live_unverified: "已激活 · 待回读", published: "回读已核验", withdrawn: "已撤稿", staged: "私有待审核", reviewed: "素材已审核", revoked: "已撤销使用" };
 const FORMATS = { article: "文章", image_text: "图文", video: "视频" };
@@ -13,7 +14,7 @@ const PLATFORM_KIND_LABELS = { owned_site: "自有官网", social: "社交内容
 const LOCALES = { "zh-CN": "中文", "en-US": "English" };
 const DESTINATION_KINDS = { owned_origin: "官网域名", profile_feed: "个人账号内容流", page: "公共页面", repository: "代码仓库", community: "主题社区", community_channel: "社区频道", artifact_repository: "AI 作品仓库" };
 const ROLE_LABELS = { cover: "封面", image: "图集图片", video: "视频", poster: "视频封面", subtitle: "字幕 VTT" };
-const TABS = { stories: "选题与版本", releases: "官网出版", media: "媒体素材", accounts: "真实账号", destinations: "发布目的地", catalog: "平台目录" };
+const TABS = { stories: "选题与版本", releases: "官网出版", revisions: "原址批量修订", media: "媒体素材", accounts: "真实账号", destinations: "发布目的地", catalog: "平台目录" };
 const EDITORIAL_READ_TIMEOUT_MS = 90_000;
 
 function timestamp(value) {
@@ -172,6 +173,7 @@ export function mountEditorialWorkbench({ api, getData, showError, afterMutation
     editorialBatchEdition.offer(receipts, preview);
     return load();
   } });
+  const revisionBatches = mountEditorialRevisionBatches(root, { api, mutate, getAssets: () => state.assets, onRender: render });
   const catalog = () => Array.isArray(state.data?.catalog) ? state.data.catalog : state.data?.catalog?.platforms || [];
   const rows = key => Array.isArray(state.data?.[key]) ? state.data[key] : [];
   const platformName = id => { const platform = catalog().find(item => item.id === id); return platform?.nameZh || platform?.name || id; };
@@ -438,7 +440,7 @@ export function mountEditorialWorkbench({ api, getData, showError, afterMutation
     if (!state.data) panel = state.error ? `<div class="form-error" role="alert">编辑服务暂时不可用。${html(state.error.message || "请刷新重试；目标服务可能尚未部署此版本。")}</div>` : '<div class="editorial-empty" role="status"><strong>正在读取编辑出版工作区…</strong><p>读取真实目录、账号、版本与发布回执。</p></div>';
     else {
       try {
-        panel = ({ stories: storyPanel, releases: releasePanel, media: mediaPanel, accounts: accountsPanel, destinations: destinationsPanel, catalog: catalogPanel }[state.tab])();
+        panel = ({ stories: storyPanel, releases: releasePanel, revisions: revisionBatches.markup, media: mediaPanel, accounts: accountsPanel, destinations: destinationsPanel, catalog: catalogPanel }[state.tab])();
       } catch (error) {
         console.error("Editorial workbench could not render", error?.name || "Error");
         panel = '<div class="form-error" role="alert">无法显示编辑数据。请刷新重试。</div>';
@@ -462,6 +464,7 @@ export function mountEditorialWorkbench({ api, getData, showError, afterMutation
     // Dependent selectors need their parent selection before restoring an unsent value.
     restoreDrafts();
     synchronizeForms();
+    revisionBatches.setActive(Boolean(state.data && state.tab === "revisions"));
     return rendered;
   }
 

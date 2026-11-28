@@ -4,6 +4,7 @@ import { loadSeedState, migratePengManagerIdentity, migrateEditorialState } from
 import { GeoOsService } from "./services/geo-os-service.mjs";
 import { LivePipelineService } from "./services/live-pipeline.mjs";
 import { createGeoOsServer } from "./http/server.mjs";
+import { createPublicArticleOverlay } from "./http/article-overlay.mjs";
 import { CodexAdapter } from "./adapters/codex.mjs";
 import { SYSTEM_IDENTITY } from "./domain/identity.mjs";
 import { GitHubAdapter } from "./adapters/github.mjs";
@@ -16,6 +17,7 @@ import { createWorkloomLaunch } from "./security/workloom-launch.mjs";
 import { AccountOperationsService } from "./services/account-operations.mjs";
 import { createMacFinalContentBackup } from "./services/final-content-backup.mjs";
 import { EditorialService } from "./services/editorial-service.mjs";
+import { EditorialRevisionBatchService } from "./services/editorial-revision-batches.mjs";
 import { MediaAssets } from "./services/media-assets.mjs";
 import { createWebsiteReadback } from "./services/website-readback.mjs";
 import { createEditorialBackup } from "./services/editorial-backup.mjs";
@@ -57,6 +59,7 @@ export async function createPengManagerApplication({
   await store.open(() => loadSeedState(dataDir));
   let constructedGeo = null;
   let constructedRuntime = null;
+  let constructedRevisionBatches = null;
   try {
   await migratePengManagerIdentity(store, dataDir);
   const publicOrigin = env.PUBLIC_ORIGIN || `http://${host === "::1" ? "[::1]" : host}:${port}`;
@@ -69,7 +72,7 @@ export async function createPengManagerApplication({
     model: env.NODE_ENV === "production" ? undefined : textModel,
   });
   const service = new GeoOsService({ store, finalContentBackup, aiApproval });
-  let editorial;
+  let editorial, articleOverlay;
   const mediaAssets = new MediaAssets({ store, aiApproval, publicAssetAuthorizer: (id, hash) => editorial?.isAssetPublic(id, hash) === true });
   await mediaAssets.initialize();
   const productionArtifacts = new ProductionArtifacts({ store, aiApproval }); await productionArtifacts.initialize();
@@ -81,7 +84,15 @@ export async function createPengManagerApplication({
   await contentOps.recover({ actor: "system", method: "local", idempotencyKey: randomUUID() });
   editorial = new EditorialService({ store, geoService: service, mediaAssets, productionArtifacts, publicOrigin, aiApproval,
     verifyReadback: createWebsiteReadback({ origin: publicOrigin, allowLoopback: env.NODE_ENV !== "production" && !env.PUBLIC_ORIGIN }),
-    beforeActivation: editorialBackup });
+    beforeActivation: editorialBackup, validateRevisionBatchExecution: EditorialRevisionBatchService.validateExecution,
+    projectPublicArticle: detail => articleOverlay?.project(detail) ?? detail,
+    verifyRollbackProjection: detail => articleOverlay?.verifyProjection(detail) });
+  const publicDir = join(rootDir, "public");
+  const overlayDirectory = env.ARTICLE_OVERLAY_DIRECTORY ? resolve(rootDir, env.ARTICLE_OVERLAY_DIRECTORY) : undefined;
+  articleOverlay = createPublicArticleOverlay({ publicDir, editorial, mediaAssets, articleOverlayDirectory: overlayDirectory });
+  const revisionBatches = new EditorialRevisionBatchService({ store, editorial, mediaAssets,
+    publicEditorial: articleOverlay?.editorial ?? editorial });
+  constructedRevisionBatches = revisionBatches;
   let runtime = videoRuntime;
   const contentDirector = new ContentDirectorService({
     store,
@@ -127,7 +138,8 @@ export async function createPengManagerApplication({
     videoEdit: new VideoEditAdapter({ upstreamRoot: join(rootDir, "engines", "video-edit") }), mediaEngine,
   });
   const server = createGeoOsServer({ service, livePipeline, geoEngine, videoRuntime: runtime,
-    publicDir: join(rootDir, "public"), allowedHosts, auth, accountOperations, editorial, mediaAssets, contentOps, productionArtifacts,
+    publicDir, allowedHosts, auth, accountOperations, editorial, mediaAssets, contentOps, productionArtifacts,
+    revisionBatches, articleOverlay,
     contentDirector,
     workloomLaunch,
     aiApproval,
@@ -138,7 +150,7 @@ export async function createPengManagerApplication({
   let listening = false;
   let stopping = false;
   return {
-    server, service, store, geoEngine, mediaEngine, auth, accountOperations, editorial, mediaAssets, editorialBackup, contentOps, contentDirector, productionArtifacts,
+    server, service, store, geoEngine, mediaEngine, auth, accountOperations, editorial, mediaAssets, editorialBackup, contentOps, contentDirector, productionArtifacts, revisionBatches,
     videoRuntime: runtime, finalContentBackup, workloomLaunch,
     get videoStart() { return videoStart; },
     async listen(options = {}) {
@@ -152,6 +164,7 @@ export async function createPengManagerApplication({
         });
         listening = true;
         if (!stopping) {
+          await revisionBatches.recover();
           contentDirector.startApprovalContinuation(logger);
           contentOps.startApprovalContinuation(logger);
         }
@@ -184,6 +197,7 @@ export async function createPengManagerApplication({
           Promise.resolve().then(() => runtime.stop()),
           contentDirector.stopApprovalContinuation(),
           contentOps.stopApprovalContinuation(),
+          revisionBatches.close(),
         ]);
         await videoStart;
         try { await geoEngine.close(); } catch (error) { results.push({ status: "rejected", reason: error }); }
@@ -198,7 +212,7 @@ export async function createPengManagerApplication({
     const cleanup = await Promise.allSettled([
       Promise.resolve().then(() => constructedRuntime?.stop()),
       Promise.resolve().then(() => constructedGeo?.close()),
-      store.close(),
+      Promise.resolve().then(() => constructedRevisionBatches?.close()).finally(() => store.close()),
     ]);
     if (cleanup.some(result => result.status === "rejected")) logger.error?.("应用初始化失败，部分资源关闭未完成，请检查进程和状态锁。");
     throw error;

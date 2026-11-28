@@ -27,13 +27,59 @@ function send(response, status, payload, writeJson) {
   writeJson(response, status, payload, payload?.etag ? { ETag: payload.etag } : {});
 }
 
+async function routeEditorialRevisionBatches({ request, response, url, principal, revisionBatches, readJsonBody,
+  writeJson, methodNotAllowed }) {
+  const root = "/api/editorial/revision-batches";
+  const path = url.pathname;
+  if (path !== root && !path.startsWith(`${root}/`)) return false;
+  const ctx = context(request, principal);
+  if (!revisionBatches) throw new ApiError(503, "EDITORIAL_REVISION_BATCHES_UNAVAILABLE", "官网批量修订服务尚未启用。");
+  const item = path.match(new RegExp(`^${root}/${ID}/items/${ID}/retry$`));
+  const batch = path.match(new RegExp(`^${root}/${ID}(?:/(authorize))?$`));
+  const hasPagination = request.method === "GET" && batch && !batch[2] && path !== `${root}/preflight` && url.search.length > 0;
+  query(url.searchParams, hasPagination ? ["offset", "limit"] : []);
+  let pagination;
+  if (hasPagination) {
+    const rawLimit = url.searchParams.get("limit") ?? "20", rawOffset = url.searchParams.get("offset") ?? "0";
+    const limit = Number(rawLimit), offset = Number(rawOffset);
+    if (!/^\d{1,3}$/.test(rawLimit) || !/^\d{1,3}$/.test(rawOffset) || limit < 1 || limit > 100 || offset > 100) {
+      throw new ApiError(400, "EDITORIAL_QUERY_INVALID", "批次分页的 limit 须为 1 至 100，offset 须为 0 至 100。");
+    }
+    pagination = { offset, limit };
+  }
+  let methods;
+  if (path === root) {
+    methods = { GET: [200, () => revisionBatches.list(ctx)], POST: [201, body => revisionBatches.create(body, ctx)] };
+  } else if (path === `${root}/preflight`) {
+    methods = { POST: [200, body => revisionBatches.preflight(body, ctx)] };
+  } else if (item) {
+    methods = { POST: [202, body => revisionBatches.retry(item[1], item[2], body, ctx)] };
+  } else if (batch?.[2]) {
+    methods = { POST: [202, body => revisionBatches.authorize(batch[1], body, ctx)] };
+  } else if (batch) {
+    methods = { GET: [200, () => revisionBatches.get(batch[1], ctx, pagination)] };
+  } else {
+    throw new ApiError(404, "EDITORIAL_REVISION_BATCH_ROUTE_NOT_FOUND", "找不到此官网批量修订接口。");
+  }
+  if (!Object.hasOwn(methods, request.method)) {
+    methodNotAllowed(response, Object.keys(methods));
+    return true;
+  }
+  const [status, handler] = methods[request.method];
+  const maxBytes = path === root || path === `${root}/preflight` ? 16_000_000 : undefined;
+  const body = request.method === "GET" ? undefined : await readJsonBody(request, maxBytes);
+  send(response, status, await handler(body), writeJson);
+  return true;
+}
+
 // Called only after the existing administrator authentication and source checks.
 // No route in this module grants or broadens the restricted bearer capability.
 export async function routeEditorialApi({
-  request, response, url, principal, editorial, mediaAssets, aiApproval, readJsonBody,
+  request, response, url, principal, editorial, mediaAssets, aiApproval, revisionBatches, readJsonBody,
   writeJson, writeEditorialBootstrap, methodNotAllowed,
 }) {
   if (!editorial) return false;
+  if (await routeEditorialRevisionBatches({ request, response, url, principal, revisionBatches, readJsonBody, writeJson, methodNotAllowed })) return true;
   const path = url.pathname;
   const fixed = {
     "/api/editorial/bootstrap": { GET: () => editorial.bootstrap() },
@@ -99,7 +145,7 @@ export async function routeEditorialApi({
     })],
     [new RegExp(`^/api/editorial/variants/${ID}$`), (id) => ({ GET: () => editorial.getVariant(id) })],
     [new RegExp(`^/api/website/releases/${ID}$`), (id) => ({ GET: () => editorial.getRelease(id) })],
-    [new RegExp(`^/api/website/releases/${ID}/(approve|publish|verify|withdraw)$`), (id, action) => ({
+    [new RegExp(`^/api/website/releases/${ID}/(approve|publish|verify|withdraw|rollback)$`), (id, action) => ({
       POST: (body, ctx) => editorial[`${action}Release`](id, body, ctx),
     })],
   ];
@@ -126,7 +172,7 @@ export async function routeEditorialApi({
     }
     const body = request.method === "GET" ? undefined : await readJsonBody(request);
     const payload = await handler(body, ctx);
-    send(response, request.method === "POST" && !/\/(?:approve|publish|verify|withdraw|transition|suggest|evidence|revoke)$/.test(path) ? 201 : 200, payload, writeJson);
+    send(response, request.method === "POST" && !/\/(?:approve|publish|verify|withdraw|rollback|transition|suggest|evidence|revoke)$/.test(path) ? 201 : 200, payload, writeJson);
     return true;
   }
 

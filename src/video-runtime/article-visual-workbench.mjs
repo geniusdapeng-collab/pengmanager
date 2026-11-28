@@ -104,7 +104,8 @@ function statusText(data) {
   const text = (label[data.state] || data.state) + ' · ' + data.nativeThreadId +
     (data.approval ? ' · ' + data.approval.id + '（' + data.approval.status + '）' : '') +
     (review ? ' · ' + (review.outcome || (review.event === 'approval.ai_attempt_started' ? 'AI 正在核对'
-      : Number.isFinite(retryAt) ? '将在 ' + new Date(retryAt).toLocaleTimeString() + ' 后自动重试' : '本次已暂停')) +
+      : review.recoveryPending ? '等待核对原审核依据并续审'
+        : Number.isFinite(retryAt) ? '将在 ' + new Date(retryAt).toLocaleTimeString() + ' 后自动重试' : '本次已暂停')) +
       (review.reason ? ' · ' + review.reason : '') : '');
   if (byId('status').textContent !== text) byId('status').textContent = text;
 }
@@ -112,7 +113,8 @@ function follow(data, source, version) {
   const review = data.approval?.ai;
   const retryAt = Date.parse(review?.retryAt);
   if (!['queued','running','pending_review'].includes(data.state) || review?.outcome === 'needs_input' ||
-      ['approval.ai_blocked','approval.ai_attempt_unresolved'].includes(review?.event) ||
+      review?.event === 'approval.ai_blocked' ||
+      (review?.event === 'approval.ai_attempt_unresolved' && !review.recoveryPending) ||
       (review?.event === 'approval.ai_attempt_refused' && !Number.isFinite(retryAt))) return;
   const delay = Number.isFinite(retryAt) ? Math.min(30_000, Math.max(6000, retryAt - Date.now())) : 6000;
   refreshTimer = setTimeout(async () => {

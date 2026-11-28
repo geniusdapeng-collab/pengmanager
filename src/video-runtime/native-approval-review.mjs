@@ -82,10 +82,18 @@ export function createNativeApprovalReviewer({ dataRoot, env = process.env, disp
       [receipt.requestHash, receipt.responseHash, receipt.contentHash, receipt.policyHash].every(value => SHA.test(value ?? '')) &&
       [receipt.usage?.inputTokens, receipt.usage?.outputTokens, receipt.usage?.totalTokens].every(value => Number.isSafeInteger(value) && value > 0),
     'NATIVE_APPROVAL_RECEIPT_INVALID', 'AI 审核缺少真实模型身份、计量或响应凭据。');
-    const verdict = validateNativeApprovalVerdict(response.value, evidenceHash, checks);
-    return { ...verdict, providerReceipt: { model: receipt.returnedModel, provider: receipt.registry.provider,
+    const providerReceipt = { model: receipt.returnedModel, provider: receipt.registry.provider,
       responseId: receipt.responseId, requestHash: receipt.requestHash, responseHash: receipt.responseHash,
-      contentHash: receipt.contentHash, policyHash: receipt.policyHash, usage: receipt.usage } };
+      contentHash: receipt.contentHash, policyHash: receipt.policyHash, usage: receipt.usage };
+    try {
+      return { ...validateNativeApprovalVerdict(response.value, evidenceHash, checks), providerReceipt };
+    } catch (error) {
+      if (error instanceof VideoRuntimeError && error.code === 'NATIVE_APPROVAL_VERDICT_INVALID') {
+        error.providerReceipt = providerReceipt;
+        error.wireSha256 = receipt.wireSha256;
+      }
+      throw error;
+    }
   }
 
   return { checkModel, prepare, review };

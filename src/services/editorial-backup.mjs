@@ -123,8 +123,27 @@ async function syncDirectory(path) {
 }
 function receipt(manifest, manifestSha256) {
   return { backupId: manifest.backupId, schema: manifest.schema, stage: manifest.stage, releaseId: manifest.releaseId,
+    ...(manifest.candidates ? { candidates: structuredClone(manifest.candidates) } : {}),
     createdAt: manifest.createdAt, sourceRevision: manifest.sourceRevision, manifestSha256,
     stateSha256: manifest.files[0].sha256, assetCount: manifest.assetCount, artifactCount: manifest.artifactCount ?? 0, totalBytes: manifest.totalBytes };
+}
+
+function assertBatchCandidates(state, candidates) {
+  if (!Array.isArray(candidates) || candidates.length < 1 || candidates.length > 10 ||
+      new Set(candidates.map(candidate => candidate?.canonicalPath)).size !== candidates.length ||
+      new Set(candidates.map(candidate => candidate?.releaseId)).size !== candidates.length) {
+    fail("EDITORIAL_BACKUP_CANDIDATE_MISMATCH", "批次备份缺少唯一的准确发布候选。");
+  }
+  for (const candidate of candidates) {
+    const release = state.websiteReleases?.find(row => row.id === candidate?.releaseId);
+    const route = state.websiteRoutes?.find(row => row.canonicalPath === candidate?.canonicalPath);
+    if (!release || !route || release.status !== "approved" || !SHA.test(candidate.snapshotHash ?? "") ||
+        release.snapshotHash !== candidate.snapshotHash || release.canonicalPath !== candidate.canonicalPath ||
+        !candidate.previousReleaseId || candidate.previousReleaseId !== route.activeReleaseId ||
+        route.storyId !== release.storyId || release.previousReleaseId !== candidate.previousReleaseId) {
+      fail("EDITORIAL_BACKUP_CANDIDATE_MISMATCH", "批次备份候选与当前活动版本不一致。");
+    }
+  }
 }
 
 async function capture({ store, mediaAssets, productionArtifacts, clock, stage, release, state, committedFile }) {
@@ -137,6 +156,7 @@ async function capture({ store, mediaAssets, productionArtifacts, clock, stage, 
         fail("EDITORIAL_BACKUP_CANDIDATE_MISMATCH", "备份必须包含当前已批准的准确公开候选。");
       }
     }
+    if (stage === "pre_batch_activation") assertBatchCandidates(state, release);
     const assets = state.mediaAssets ?? [];
     const artifacts = state.productionArtifacts ?? [];
     const native = state.schemaVersion >= 3 || artifacts.length > 0;
@@ -184,7 +204,8 @@ async function capture({ store, mediaAssets, productionArtifacts, clock, stage, 
         files.push({ path: `worker-artifacts/objects/${artifact.id}.bin`, kind: "artifact", artifactId: artifact.id, size: artifact.size, sha256: artifact.sha256 });
       } finally { await opened.handle.close(); }
     }
-    const manifest = { schema: native ? NATIVE_SCHEMA : SCHEMA, backupId, stage, releaseId: release?.id ?? null, candidateSnapshotHash: release?.snapshotHash ?? null, createdAt: clock().toISOString(),
+    const manifest = { schema: native ? NATIVE_SCHEMA : SCHEMA, backupId, stage, releaseId: release?.id ?? null, candidateSnapshotHash: release?.snapshotHash ?? null,
+      ...(stage === "pre_batch_activation" ? { candidates: release } : {}), createdAt: clock().toISOString(),
       sourceRevision: state.revision, sourceSchemaVersion: state.schemaVersion, assetCount: assets.length,
       ...(native ? { artifactCount: artifacts.length } : {}),
       totalBytes: stateFile.size + assetBytes, files };
@@ -236,6 +257,8 @@ export function createEditorialBackup({ store, mediaAssets, productionArtifacts,
   // EditorialService calls this while its writer queue holds the approved, unchanged revision.
   beforeActivation.captureCommitted = (release, state) =>
     run("pre_activation", release, state, store.committedStateFile(state));
+  beforeActivation.captureBatchCommitted = (candidates, state) =>
+    run("pre_batch_activation", structuredClone(candidates), state, store.committedStateFile(state));
   beforeActivation.captureCurrent = async () => run("current", null, store.snapshot());
   return beforeActivation;
 }
@@ -253,7 +276,8 @@ async function inspectBackup({ store, backupId, expectedManifestSha256 }, captur
     manifest = JSON.parse(bytes.toString("utf8"));
   } finally { await manifestFile.handle.close(); }
   const native = manifest?.schema === NATIVE_SCHEMA;
-  if (![SCHEMA, NATIVE_SCHEMA].includes(manifest?.schema) || manifest.backupId !== backupId || !["pre_activation", "current"].includes(manifest.stage)
+  if (![SCHEMA, NATIVE_SCHEMA].includes(manifest?.schema) || manifest.backupId !== backupId || !["pre_activation", "pre_batch_activation", "current"].includes(manifest.stage)
+    || (manifest.stage !== "pre_batch_activation" && manifest.candidates !== undefined)
     || !Array.isArray(manifest.files) || !Number.isSafeInteger(manifest.assetCount) || manifest.assetCount < 0
     || (native && (!Number.isSafeInteger(manifest.artifactCount) || manifest.artifactCount < 0))
     || (!native && (manifest.artifactCount !== undefined || manifest.sourceSchemaVersion === 3))
@@ -302,6 +326,7 @@ async function inspectBackup({ store, backupId, expectedManifestSha256 }, captur
   const artifacts = state.productionArtifacts ?? [];
   if (manifest.stage === "pre_activation" && !state.websiteReleases?.some(row => row.id === manifest.releaseId
     && row.status === "approved" && row.snapshotHash === manifest.candidateSnapshotHash)) fail("EDITORIAL_BACKUP_CANDIDATE_MISMATCH", "备份的候选修订与清单不一致。");
+  if (manifest.stage === "pre_batch_activation") assertBatchCandidates(state, manifest.candidates);
   if (assets.length !== manifest.assetCount || artifacts.length !== (manifest.artifactCount ?? 0) || total !== manifest.totalBytes || state.revision !== manifest.sourceRevision
     || state.schemaVersion !== manifest.sourceSchemaVersion || assets.some(asset => !manifest.files.some(entry => entry.kind === "media"
       && entry.assetId === asset.id && entry.sha256 === asset.sha256 && entry.size === asset.size)) || artifacts.some(artifact => !manifest.files.some(entry => entry.kind === "artifact"
